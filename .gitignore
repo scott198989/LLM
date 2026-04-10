@@ -1,0 +1,17 @@
+venv/
+__pycache__/
+*.pyc
+*.pth
+*.pt
+*.bin
+*.safetensors
+data/raw/*
+data/processed/*
+logs/*
+models/checkpoints/*
+models/tokenizers/*
+.env
+*.egg-info/
+dist/
+build/
+.ipynb_checkpoints/

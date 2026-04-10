@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(nvidia-smi)",
+      "Bash(source venv/Scripts/activate)",
+      "Bash(python -m pip install --upgrade pip)"
+    ]
+  }
+}
