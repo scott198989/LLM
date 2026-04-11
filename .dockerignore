@@ -1,0 +1,31 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environments  (can be 2 GB+; DO NOT copy into the image)
+venv/
+.venv/
+env/
+ENV/
+.env
+
+# Git history
+.git/
+.gitignore
+.gitattributes
+
+# Generated outputs — recreated on RunPod during setup/training
+data/processed/
+models/checkpoints/
+logs/
+
+# OS artifacts
+.DS_Store
+Thumbs.db
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo

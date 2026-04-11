@@ -58,6 +58,20 @@ accelerator = Accelerator()
 check("Accelerate device", lambda: str(accelerator.device))
 check("Mixed precision", lambda: str(accelerator.mixed_precision))
 
+print("\n=== Training Extras ===")
+try:
+    from torch.utils.tensorboard import SummaryWriter  # noqa: F401
+    import tensorboard as _tb
+    check("tensorboard", lambda: _tb.__version__)
+except ImportError:
+    print("  [FAIL] tensorboard: not installed — pip install tensorboard")
+
+try:
+    import customtkinter as _ctk
+    check("customtkinter (GUI)", lambda: _ctk.__version__)
+except ImportError:
+    print("  [WARN] customtkinter: not installed (GUI only) — pip install customtkinter")
+
 print("\n=== Project Structure ===")
 import os
 dirs = ["data/raw", "data/processed", "models/checkpoints", "models/tokenizers", "scripts", "logs"]
@@ -66,5 +80,17 @@ for d in dirs:
     path = os.path.join(root, d)
     status = "OK" if os.path.isdir(path) else "MISSING"
     print(f"  [{status}] {d}/")
+
+# Check for training data
+raw_dir = os.path.join(root, "data", "raw")
+if os.path.isdir(raw_dir):
+    data_files = [f for f in os.listdir(raw_dir)
+                  if os.path.splitext(f)[1].lower() in {".jsonl", ".txt", ".docx"}]
+    if data_files:
+        print(f"\n  Training data files in data/raw/: {len(data_files)}")
+        for f in data_files[:5]:
+            print(f"    {f}")
+    else:
+        print("\n  [WARN] No training data files found in data/raw/ — add .jsonl/.txt/.docx files")
 
 print("\n=== Setup Complete ===\n")

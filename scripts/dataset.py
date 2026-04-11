@@ -43,11 +43,11 @@ class TokenDataset(Dataset):
 
 
 def build_dataloaders(
-    processed_dir: str = "data/processed",
-    batch_size:    int  = 16,
-    num_workers:   int  = 0,
-    pin_memory:    bool = True,
-    stride:        int | None = None,
+    processed_dir: str        = "data/processed",
+    batch_size:    int        = 16,
+    num_workers:   int        = 0,
+    pin_memory:    bool | None = None,   # None = auto (True when num_workers > 0)
+    stride:        int | None  = None,
 ) -> tuple[DataLoader, DataLoader, dict]:
     """
     Load train_tokens.pt + val_tokens.pt, return (train_loader, val_loader, info).
@@ -71,21 +71,30 @@ def build_dataloaders(
     train_ds = TokenDataset(train_tokens, block_size, stride=stride)
     val_ds   = TokenDataset(val_tokens,   block_size, stride=block_size)  # val always non-overlapping
 
+    # pin_memory only helps when workers > 0 and a CUDA device is available
+    _pin      = pin_memory if pin_memory is not None else (num_workers > 0)
+    _persist  = num_workers > 0   # keep workers alive between epochs
+    _prefetch = 2 if num_workers > 0 else None
+
     train_loader = DataLoader(
         train_ds,
         batch_size=batch_size,
         shuffle=True,
         num_workers=num_workers,
-        pin_memory=pin_memory,
+        pin_memory=_pin,
         drop_last=True,
+        persistent_workers=_persist,
+        prefetch_factor=_prefetch,
     )
     val_loader = DataLoader(
         val_ds,
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
-        pin_memory=pin_memory,
+        pin_memory=_pin,
         drop_last=False,
+        persistent_workers=_persist,
+        prefetch_factor=_prefetch,
     )
 
     return train_loader, val_loader, info

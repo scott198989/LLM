@@ -31,10 +31,19 @@ from tqdm import tqdm
 
 
 # ---------------------------------------------------------------------------
-# GPT-2 special tokens
+# Special tokens
 # ---------------------------------------------------------------------------
-SEP_TOKEN  = "<|sep|>"          # separates prompt from completion
-EOT_TOKEN  = "<|endoftext|>"    # GPT-2's built-in EOS / document boundary
+SEP_TOKEN        = "<|sep|>"          # separates prompt from completion (legacy)
+EOT_TOKEN        = "<|endoftext|>"    # GPT-2's built-in EOS / document boundary
+THINK_TOKEN      = "<|think|>"        # opens  Chain-of-Thought reasoning block
+END_THINK_TOKEN  = "<|/think|>"       # closes Chain-of-Thought reasoning block
+
+# ChatML / system-prompt tokens
+SYSTEM_TOKEN     = "<|system|>"       # opens  system-level instructions
+END_SYSTEM_TOKEN = "<|/system|>"      # closes system-level instructions
+USER_TOKEN       = "<|user|>"         # opens  user turn
+END_USER_TOKEN   = "<|/user|>"        # closes user turn
+ASST_TOKEN       = "<|assistant|>"    # opens  assistant turn (model generates from here)
 
 
 # ---------------------------------------------------------------------------
@@ -64,9 +73,23 @@ def load_jsonl(path: str) -> list[str]:
                 continue
 
             if prompt and completion:
-                text = f"{EOT_TOKEN}{prompt}{SEP_TOKEN}{completion}{EOT_TOKEN}"
+                # ChatML format — optionally include a per-record system field
+                system = obj.get("system", "").strip()
+                if system:
+                    text = (
+                        f"{EOT_TOKEN}"
+                        f"{SYSTEM_TOKEN}{system}{END_SYSTEM_TOKEN}"
+                        f"{USER_TOKEN}{prompt}{END_USER_TOKEN}"
+                        f"{ASST_TOKEN}{completion}{EOT_TOKEN}"
+                    )
+                else:
+                    text = (
+                        f"{EOT_TOKEN}"
+                        f"{USER_TOKEN}{prompt}{END_USER_TOKEN}"
+                        f"{ASST_TOKEN}{completion}{EOT_TOKEN}"
+                    )
             else:
-                # completion-only record (pre-formatted text)
+                # completion-only record (pre-formatted text / plain document)
                 text = f"{EOT_TOKEN}{prompt or completion}{EOT_TOKEN}"
 
             records.append(text)
@@ -259,10 +282,16 @@ def main():
 
     print("\n=== 2. Loading GPT-2 tokenizer ===")
     tokenizer = GPT2TokenizerFast.from_pretrained("gpt2")
-    tokenizer.add_special_tokens({"additional_special_tokens": [SEP_TOKEN]})
+    tokenizer.add_special_tokens({
+        "additional_special_tokens": [
+            SEP_TOKEN, THINK_TOKEN, END_THINK_TOKEN,
+            SYSTEM_TOKEN, END_SYSTEM_TOKEN, USER_TOKEN, END_USER_TOKEN, ASST_TOKEN,
+        ]
+    })
     # GPT-2's built-in EOS is already <|endoftext|>; map pad → EOS
     tokenizer.pad_token = tokenizer.eos_token
-    print(f"  Vocab size: {len(tokenizer):,}  (GPT-2 base: 50257, +1 for <|sep|>)")
+    print(f"  Vocab size: {len(tokenizer):,}  "
+          f"(GPT-2 base: 50257, +8 special tokens)")
 
     print("\n=== 3. Tokenising ===")
     tokens = tokenize_corpus(texts, tokenizer, args.block_size)
@@ -292,14 +321,30 @@ def main():
     print(f"  {val_path}")
 
     info = {
-        "vocab_size":  len(tokenizer),
-        "block_size":  args.block_size,
-        "train_tokens": len(train_t),
-        "val_tokens":   len(val_t),
-        "sep_token":    SEP_TOKEN,
-        "eot_token":    EOT_TOKEN,
-        "sep_token_id": tokenizer.convert_tokens_to_ids(SEP_TOKEN),
-        "eot_token_id": tokenizer.eos_token_id,
+        "vocab_size":           len(tokenizer),
+        "block_size":           args.block_size,
+        "train_tokens":         len(train_t),
+        "val_tokens":           len(val_t),
+        # Token strings
+        "sep_token":            SEP_TOKEN,
+        "eot_token":            EOT_TOKEN,
+        "think_token":          THINK_TOKEN,
+        "end_think_token":      END_THINK_TOKEN,
+        "system_token":         SYSTEM_TOKEN,
+        "end_system_token":     END_SYSTEM_TOKEN,
+        "user_token":           USER_TOKEN,
+        "end_user_token":       END_USER_TOKEN,
+        "asst_token":           ASST_TOKEN,
+        # Token IDs
+        "sep_token_id":         tokenizer.convert_tokens_to_ids(SEP_TOKEN),
+        "eot_token_id":         tokenizer.eos_token_id,
+        "think_token_id":       tokenizer.convert_tokens_to_ids(THINK_TOKEN),
+        "end_think_token_id":   tokenizer.convert_tokens_to_ids(END_THINK_TOKEN),
+        "system_token_id":      tokenizer.convert_tokens_to_ids(SYSTEM_TOKEN),
+        "end_system_token_id":  tokenizer.convert_tokens_to_ids(END_SYSTEM_TOKEN),
+        "user_token_id":        tokenizer.convert_tokens_to_ids(USER_TOKEN),
+        "end_user_token_id":    tokenizer.convert_tokens_to_ids(END_USER_TOKEN),
+        "asst_token_id":        tokenizer.convert_tokens_to_ids(ASST_TOKEN),
     }
     info_path = os.path.join(args.out_dir, "tokenizer_info.json")
     with open(info_path, "w") as f:
@@ -310,8 +355,14 @@ def main():
     show_samples(tokens, tokenizer, args.block_size)
 
     print("\n=== Done ===")
-    print(f"  vocab_size to use in model config: {len(tokenizer)}")
-    print(f"  Update Config.vocab_size = {len(tokenizer)} in scripts/train.py\n")
+    print(f"  vocab_size             : {len(tokenizer)}")
+    print(f"  think_token_id         : {info['think_token_id']}  (<|think|>)")
+    print(f"  end_think_token_id     : {info['end_think_token_id']}  (<|/think|>)")
+    print(f"  system_token_id        : {info['system_token_id']}  (<|system|>)")
+    print(f"  user_token_id          : {info['user_token_id']}  (<|user|>)")
+    print(f"  asst_token_id          : {info['asst_token_id']}  (<|assistant|>)")
+    print(f"  Chain-of-Thought ready : yes — use model.generate_cot() at inference")
+    print(f"  System-prompt ready    : yes — set via InferenceEngine.set_system_prompt()\n")
 
 
 if __name__ == "__main__":

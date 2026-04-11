@@ -1,5 +1,5 @@
-# Install PyTorch separately with CUDA support:
-# pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
+# PyTorch is pre-installed on RunPod images (CUDA 12.4).
+# For local install: pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
 
 transformers>=4.40.0
 datasets>=2.19.0
@@ -8,3 +8,7 @@ numpy>=1.26.0
 matplotlib>=3.8.0
 tqdm>=4.66.0
 accelerate>=0.30.0
+requests>=2.31.0
+python-docx>=1.1.0
+tensorboard>=2.14.0
+customtkinter>=5.2.0
