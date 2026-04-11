@@ -11,6 +11,7 @@ Can also be run standalone to inspect batches:
 import json
 import os
 
+import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset
 
@@ -50,7 +51,7 @@ def build_dataloaders(
     stride:        int | None  = None,
 ) -> tuple[DataLoader, DataLoader, dict]:
     """
-    Load train_tokens.pt + val_tokens.pt, return (train_loader, val_loader, info).
+    Load train.bin + val.bin, return (train_loader, val_loader, info).
 
     info dict contains vocab_size, block_size, etc. from tokenizer_info.json.
     """
@@ -64,12 +65,34 @@ def build_dataloaders(
         info = json.load(f)
 
     block_size = info["block_size"]
+    token_dtype = np.dtype(info.get("token_dtype", "uint16"))
 
-    train_tokens = torch.load(os.path.join(processed_dir, "train_tokens.pt"), weights_only=True)
-    val_tokens   = torch.load(os.path.join(processed_dir, "val_tokens.pt"),   weights_only=True)
+    train_tokens = _load_token_file(
+        processed_dir,
+        preferred=info.get("train_file", "train.bin"),
+        legacy="train_tokens.pt",
+        dtype=token_dtype,
+    )
+    val_tokens = _load_token_file(
+        processed_dir,
+        preferred=info.get("val_file", "val.bin"),
+        legacy="val_tokens.pt",
+        dtype=token_dtype,
+    )
 
     train_ds = TokenDataset(train_tokens, block_size, stride=stride)
     val_ds   = TokenDataset(val_tokens,   block_size, stride=block_size)  # val always non-overlapping
+
+    if len(train_ds) == 0:
+        raise ValueError(
+            f"Training split is too small for block_size={block_size}. "
+            "Re-run preprocess.py with more data."
+        )
+    if len(val_ds) == 0:
+        raise ValueError(
+            f"Validation split is too small for block_size={block_size}. "
+            "Re-run preprocess.py or reduce the validation split only if you know why."
+        )
 
     # pin_memory only helps when workers > 0 and a CUDA device is available
     _pin      = pin_memory if pin_memory is not None else (num_workers > 0)
@@ -98,6 +121,23 @@ def build_dataloaders(
     )
 
     return train_loader, val_loader, info
+
+
+def _load_token_file(processed_dir: str, preferred: str, legacy: str, dtype: np.dtype) -> torch.Tensor:
+    """Load token IDs from the new .bin format, with legacy .pt fallback."""
+    bin_path = os.path.join(processed_dir, preferred)
+    if os.path.exists(bin_path):
+        arr = np.fromfile(bin_path, dtype=dtype)
+        return torch.from_numpy(arr.astype(np.int64))
+
+    legacy_path = os.path.join(processed_dir, legacy)
+    if os.path.exists(legacy_path):
+        return torch.load(legacy_path, weights_only=True)
+
+    raise FileNotFoundError(
+        f"Neither {bin_path} nor {legacy_path} exists.\n"
+        "Run:  python scripts/preprocess.py --data_dir data/raw"
+    )
 
 
 # ---------------------------------------------------------------------------

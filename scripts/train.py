@@ -100,7 +100,7 @@ class Config:
     n_layer      = 12
     n_head       = 12
     n_embd       = 768
-    block_size   = 1024
+    block_size   = 2048
     dropout      = 0.1
 
     # ── Training ────────────────────────────────────────────────────────────
@@ -638,9 +638,9 @@ def train(args: argparse.Namespace) -> None:   # noqa: C901  (intentionally long
     print(f"  Steps/epoch : {steps_per_epoch:,}    Total steps : {total_steps:,}")
 
     # ── Data quality warnings ─────────────────────────────────────────────────
-    if cfg.block_size < 512:
+    if cfg.block_size < 2048:
         print(f"\n  [WARN] block_size={cfg.block_size} — re-run preprocess.py with "
-              "--block_size 1024 for full context length")
+              "--block_size 2048 for full context length")
     total_toks = info.get("train_tokens", 0) + info.get("val_tokens", 0)
     if total_toks < 1_000_000:
         print(f"\n  [WARN] Only {total_toks:,} tokens in dataset.  A 124 M-param model "

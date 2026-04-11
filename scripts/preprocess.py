@@ -8,8 +8,8 @@ Sources supported:
   - Public-domain books auto-downloaded from Project Gutenberg (gap-filling)
 
 Output:
-  data/processed/train_tokens.pt   — LongTensor of token IDs (80%)
-  data/processed/val_tokens.pt     — LongTensor of token IDs (20%)
+  data/processed/train.bin         — token IDs for training records (95%)
+  data/processed/val.bin           — token IDs for validation records (5%)
   data/processed/tokenizer_info.json
 
 Usage:
@@ -20,10 +20,13 @@ Usage:
 
 import argparse
 import json
+import math
 import os
+import random
 import re
 import sys
 
+import numpy as np
 import requests
 import torch
 from transformers import GPT2TokenizerFast
@@ -44,6 +47,8 @@ END_SYSTEM_TOKEN = "<|/system|>"      # closes system-level instructions
 USER_TOKEN       = "<|user|>"         # opens  user turn
 END_USER_TOKEN   = "<|/user|>"        # closes user turn
 ASST_TOKEN       = "<|assistant|>"    # opens  assistant turn (model generates from here)
+
+DEFAULT_SPLIT_SEED = 1337
 
 
 # ---------------------------------------------------------------------------
@@ -207,16 +212,46 @@ def load_directory(data_dir: str) -> list[str]:
 # Tokenise + chunk
 # ---------------------------------------------------------------------------
 
-def tokenize_corpus(texts: list[str], tokenizer: GPT2TokenizerFast, block_size: int) -> torch.Tensor:
+def tokenize_corpus(texts: list[str], tokenizer: GPT2TokenizerFast, label: str) -> torch.Tensor:
     """
-    Tokenise all texts, concatenate, then return as a flat LongTensor.
-    The DataLoader will slice this into (x, y) pairs of length block_size.
+    Tokenise all texts in a split and return a flat LongTensor.
     """
     all_ids: list[int] = []
-    for text in tqdm(texts, desc="  Tokenising", unit="seg"):
+    for text in tqdm(texts, desc=f"  {label}", unit="seg"):
         ids = tokenizer.encode(text, add_special_tokens=False)
         all_ids.extend(ids)
     return torch.tensor(all_ids, dtype=torch.long)
+
+
+def split_records(texts: list[str], val_split: float, seed: int) -> tuple[list[str], list[str]]:
+    """Split formatted records into train / validation lists using a fixed seed."""
+    if not 0.0 <= val_split < 1.0:
+        raise ValueError("--val_split must be in the range [0, 1).")
+    if len(texts) < 2 or val_split == 0.0:
+        return texts, []
+
+    val_count = min(len(texts) - 1, max(1, math.floor(len(texts) * val_split + 0.5)))
+    indices = list(range(len(texts)))
+    random.Random(seed).shuffle(indices)
+    val_idx = set(indices[:val_count])
+
+    train_texts = [text for idx, text in enumerate(texts) if idx not in val_idx]
+    val_texts = [text for idx, text in enumerate(texts) if idx in val_idx]
+    return train_texts, val_texts
+
+
+def token_storage_dtype(vocab_size: int) -> np.dtype:
+    """Pick a compact binary dtype that still fits the tokenizer vocabulary."""
+    if vocab_size <= np.iinfo(np.uint16).max:
+        return np.dtype(np.uint16)
+    if vocab_size <= np.iinfo(np.uint32).max:
+        return np.dtype(np.uint32)
+    return np.dtype(np.int64)
+
+
+def save_bin(path: str, tokens: torch.Tensor, dtype: np.dtype) -> None:
+    """Persist a flat token tensor to a binary .bin file."""
+    np.asarray(tokens.cpu().numpy(), dtype=dtype).tofile(path)
 
 
 # ---------------------------------------------------------------------------
@@ -247,8 +282,8 @@ def main():
     parser = argparse.ArgumentParser(description="Preprocess text data for LLM training")
     parser.add_argument("--data_dir",   default="data/raw",         help="Directory with .jsonl/.docx/.txt files")
     parser.add_argument("--out_dir",    default="data/processed",   help="Output directory")
-    parser.add_argument("--block_size", type=int, default=512,       help="Token sequence length per training example")
-    parser.add_argument("--val_split",  type=float, default=0.2,     help="Fraction held out for validation")
+    parser.add_argument("--block_size", type=int, default=2048,      help="Token sequence length per training example")
+    parser.add_argument("--val_split",  type=float, default=0.05,    help="Fraction of records held out for validation")
     parser.add_argument("--gutenberg",  nargs="*", type=int,
                         metavar="BOOK_ID",
                         help="Project Gutenberg book IDs to download for gap-filling, e.g. --gutenberg 1342 84")
@@ -280,7 +315,13 @@ def main():
 
     print(f"\n  Total segments: {len(texts):,}")
 
-    print("\n=== 2. Loading GPT-2 tokenizer ===")
+    print("\n=== 2. Train / validation split (record-level, reproducible) ===")
+    train_texts, val_texts = split_records(texts, args.val_split, DEFAULT_SPLIT_SEED)
+    print(f"  Split seed:    {DEFAULT_SPLIT_SEED}")
+    print(f"  Train records: {len(train_texts):,}")
+    print(f"  Val records:   {len(val_texts):,}")
+
+    print("\n=== 3. Loading GPT-2 tokenizer ===")
     tokenizer = GPT2TokenizerFast.from_pretrained("gpt2")
     tokenizer.add_special_tokens({
         "additional_special_tokens": [
@@ -293,30 +334,26 @@ def main():
     print(f"  Vocab size: {len(tokenizer):,}  "
           f"(GPT-2 base: 50257, +8 special tokens)")
 
-    print("\n=== 3. Tokenising ===")
-    tokens = tokenize_corpus(texts, tokenizer, args.block_size)
-    total  = len(tokens)
-    print(f"  Total tokens: {total:,}")
-
-    min_needed = args.block_size * 10
-    if total < min_needed:
-        print(f"\n  [WARN] Only {total} tokens — need at least {min_needed} for meaningful training.")
-        print(  "         Add more data or use --gutenberg to pull in public-domain books.")
-
-    print("\n=== 4. Train / validation split (80/20) ===")
-    split   = int(total * (1 - args.val_split))
-    # Align to block_size boundary
-    split   = (split // args.block_size) * args.block_size
-    train_t = tokens[:split]
-    val_t   = tokens[split:]
+    print("\n=== 4. Tokenising ===")
+    train_t = tokenize_corpus(train_texts, tokenizer, label="Tokenising train")
+    val_t   = tokenize_corpus(val_texts,   tokenizer, label="Tokenising val")
     print(f"  Train tokens: {len(train_t):,}  ({len(train_t)//args.block_size:,} full blocks)")
     print(f"  Val tokens:   {len(val_t):,}  ({len(val_t)//args.block_size:,} full blocks)")
 
+    min_needed = args.block_size * 10
+    if len(train_t) < min_needed:
+        print(f"\n  [WARN] Only {len(train_t):,} training tokens — need at least {min_needed:,} for meaningful training.")
+        print(  "         Add more data or use --gutenberg to pull in public-domain books.")
+    if len(train_t) < 5_000_000:
+        print(f"\n  [WARN] Training split has only {len(train_t):,} tokens.")
+        print(  "         That's under the recommended 5,000,000 training-token floor.")
+
     print("\n=== 5. Saving ===")
-    train_path = os.path.join(args.out_dir, "train_tokens.pt")
-    val_path   = os.path.join(args.out_dir, "val_tokens.pt")
-    torch.save(train_t, train_path)
-    torch.save(val_t,   val_path)
+    token_dtype = token_storage_dtype(len(tokenizer))
+    train_path = os.path.join(args.out_dir, "train.bin")
+    val_path   = os.path.join(args.out_dir, "val.bin")
+    save_bin(train_path, train_t, token_dtype)
+    save_bin(val_path,   val_t,   token_dtype)
     print(f"  {train_path}")
     print(f"  {val_path}")
 
@@ -325,6 +362,13 @@ def main():
         "block_size":           args.block_size,
         "train_tokens":         len(train_t),
         "val_tokens":           len(val_t),
+        "train_records":        len(train_texts),
+        "val_records":          len(val_texts),
+        "val_split":            args.val_split,
+        "split_seed":           DEFAULT_SPLIT_SEED,
+        "train_file":           os.path.basename(train_path),
+        "val_file":             os.path.basename(val_path),
+        "token_dtype":          token_dtype.name,
         # Token strings
         "sep_token":            SEP_TOKEN,
         "eot_token":            EOT_TOKEN,
@@ -352,10 +396,13 @@ def main():
     print(f"  {info_path}")
 
     print("\n=== 6. Sample verification ===")
-    show_samples(tokens, tokenizer, args.block_size)
+    sample_tokens = train_t if len(train_t) else val_t
+    show_samples(sample_tokens, tokenizer, args.block_size)
 
     print("\n=== Done ===")
     print(f"  vocab_size             : {len(tokenizer)}")
+    print(f"  total training tokens  : {len(train_t):,}")
+    print(f"  total validation tokens: {len(val_t):,}")
     print(f"  think_token_id         : {info['think_token_id']}  (<|think|>)")
     print(f"  end_think_token_id     : {info['end_think_token_id']}  (<|/think|>)")
     print(f"  system_token_id        : {info['system_token_id']}  (<|system|>)")

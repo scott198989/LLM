@@ -54,7 +54,7 @@ fi
 # ---------------------------------------------------------------------------
 # Done
 # ---------------------------------------------------------------------------
-if [[ -f "data/processed/train_tokens.pt" ]]; then
+if [[ -f "data/processed/train.bin" || -f "data/processed/train_tokens.pt" ]]; then
     echo "=== Setup complete. Preprocessed data found. ==="
     echo "Launch training with:"
     echo "  bash scripts/train_runpod.sh"
