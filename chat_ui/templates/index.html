@@ -1,0 +1,1020 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Qwen3 · Local Chat</title>
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+  <style>
+    /* ── RESET & BASE ───────────────────────────────────────────────────── */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:           #07070f;
+      --surface:      #0e0e1a;
+      --surface2:     #14142a;
+      --surface3:     #1c1c33;
+      --border:       #252540;
+      --border-hi:    #363660;
+      --accent:       #6366f1;
+      --accent-hi:    #818cf8;
+      --accent-dim:   rgba(99,102,241,.13);
+      --accent-glow:  rgba(99,102,241,.35);
+      --purple:       #8b5cf6;
+      --amber:        #f59e0b;
+      --amber-dim:    rgba(245,158,11,.10);
+      --amber-border: rgba(245,158,11,.25);
+      --green:        #10b981;
+      --red:          #ef4444;
+      --text:         #e2e8f0;
+      --text-2:       #94a3b8;
+      --text-3:       #4b5675;
+      --user-grad:    linear-gradient(145deg,#1e1b4b,#2e1f72);
+      --r:            12px;
+      --r-sm:         8px;
+      --r-lg:         18px;
+    }
+
+    html, body { height: 100%; overflow: hidden; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      display: flex;
+    }
+
+    ::-webkit-scrollbar { width: 5px; height: 5px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+    ::-webkit-scrollbar-thumb:hover { background: var(--border-hi); }
+
+    /* ── SIDEBAR ────────────────────────────────────────────────────────── */
+    #sidebar {
+      width: 285px;
+      min-width: 285px;
+      background: var(--surface);
+      border-right: 1px solid var(--border);
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    .sb-head {
+      padding: 18px 18px 14px;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .logo {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 10px;
+    }
+
+    .logo-gem {
+      width: 34px; height: 34px;
+      background: linear-gradient(135deg, var(--accent), var(--purple));
+      border-radius: 9px;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 17px;
+      box-shadow: 0 0 14px var(--accent-glow);
+      flex-shrink: 0;
+    }
+
+    .logo-name {
+      font-size: 15px;
+      font-weight: 700;
+      background: linear-gradient(135deg, #e2e8f0 30%, #a5b4fc);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+      letter-spacing: -.01em;
+    }
+
+    .status-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      background: var(--accent-dim);
+      border: 1px solid rgba(99,102,241,.28);
+      color: #a5b4fc;
+      font-size: 11px;
+      font-weight: 600;
+      padding: 3px 9px;
+      border-radius: 20px;
+      letter-spacing: .02em;
+    }
+
+    .dot-live {
+      width: 6px; height: 6px;
+      background: var(--green);
+      border-radius: 50%;
+      animation: live 2s ease-in-out infinite;
+    }
+
+    @keyframes live { 0%,100%{opacity:1;transform:scale(1)} 50%{opacity:.4;transform:scale(.7)} }
+
+    .sb-body {
+      flex: 1;
+      overflow-y: auto;
+      padding: 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 18px;
+    }
+
+    .ctrl-group { display: flex; flex-direction: column; gap: 8px; }
+
+    .ctrl-label {
+      font-size: 10px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: .1em;
+      color: var(--text-3);
+    }
+
+    textarea.sys-prompt {
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: var(--r-sm);
+      color: var(--text);
+      font-family: inherit;
+      font-size: 12.5px;
+      line-height: 1.55;
+      padding: 9px 11px;
+      resize: vertical;
+      min-height: 80px;
+      max-height: 180px;
+      width: 100%;
+      transition: border-color .2s;
+    }
+    textarea.sys-prompt:focus { outline: none; border-color: var(--accent); }
+
+    .slider-row { display: flex; flex-direction: column; gap: 5px; }
+
+    .slider-top {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    .slider-name { font-size: 12.5px; color: var(--text-2); }
+
+    .slider-val {
+      font-size: 11px;
+      font-weight: 700;
+      color: #a5b4fc;
+      background: var(--accent-dim);
+      padding: 2px 6px;
+      border-radius: 4px;
+      min-width: 38px;
+      text-align: center;
+    }
+
+    input[type=range] {
+      -webkit-appearance: none;
+      width: 100%; height: 3px;
+      background: var(--surface3);
+      border-radius: 2px;
+      outline: none;
+      cursor: pointer;
+    }
+    input[type=range]::-webkit-slider-thumb {
+      -webkit-appearance: none;
+      width: 13px; height: 13px;
+      border-radius: 50%;
+      background: var(--accent);
+      cursor: pointer;
+      box-shadow: 0 0 6px var(--accent-glow);
+      transition: transform .1s, background .15s;
+    }
+    input[type=range]::-webkit-slider-thumb:hover {
+      background: var(--accent-hi);
+      transform: scale(1.25);
+    }
+
+    .toggle-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 9px 11px;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: var(--r-sm);
+    }
+
+    .toggle-info { display: flex; flex-direction: column; gap: 1px; }
+    .toggle-title { font-size: 12.5px; color: var(--text); font-weight: 500; }
+    .toggle-sub { font-size: 10.5px; color: var(--text-3); }
+
+    .switch { position: relative; width: 38px; height: 21px; flex-shrink: 0; }
+    .switch input { opacity: 0; width: 0; height: 0; }
+
+    .switch-track {
+      position: absolute; inset: 0;
+      background: var(--surface3);
+      border: 1px solid var(--border);
+      border-radius: 11px;
+      cursor: pointer;
+      transition: .25s;
+    }
+    .switch-track::before {
+      content: '';
+      position: absolute;
+      width: 15px; height: 15px;
+      left: 2px; top: 2px;
+      background: var(--text-3);
+      border-radius: 50%;
+      transition: .25s;
+    }
+    .switch input:checked + .switch-track {
+      background: var(--accent-dim);
+      border-color: var(--accent);
+    }
+    .switch input:checked + .switch-track::before {
+      transform: translateX(17px);
+      background: var(--accent);
+    }
+
+    .sb-foot {
+      padding: 12px 16px;
+      border-top: 1px solid var(--border);
+    }
+
+    .btn-clear {
+      width: 100%;
+      padding: 8px;
+      background: transparent;
+      border: 1px solid var(--border);
+      border-radius: var(--r-sm);
+      color: var(--text-3);
+      font-size: 12.5px;
+      cursor: pointer;
+      transition: all .2s;
+      display: flex; align-items: center; justify-content: center; gap: 6px;
+    }
+    .btn-clear:hover { border-color: var(--red); color: var(--red); background: rgba(239,68,68,.07); }
+
+    /* ── MAIN ───────────────────────────────────────────────────────────── */
+    #main {
+      flex: 1;
+      min-width: 0;
+      display: flex;
+      flex-direction: column;
+      background: var(--bg);
+    }
+
+    .chat-header {
+      padding: 14px 22px;
+      border-bottom: 1px solid var(--border);
+      background: var(--surface);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-shrink: 0;
+    }
+
+    .header-title { font-size: 13.5px; font-weight: 600; }
+    .header-sub { font-size: 11px; color: var(--text-3); margin-top: 1px; }
+
+    .vram-pill {
+      font-size: 11px;
+      color: var(--text-3);
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      padding: 3px 10px;
+      border-radius: 20px;
+    }
+
+    /* ── MESSAGES ───────────────────────────────────────────────────────── */
+    #messages {
+      flex: 1;
+      overflow-y: auto;
+      padding: 28px 24px;
+      display: flex;
+      flex-direction: column;
+      gap: 22px;
+    }
+
+    .welcome {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 14px;
+      color: var(--text-3);
+      text-align: center;
+      padding: 40px 24px;
+      pointer-events: none;
+    }
+
+    .welcome-icon {
+      width: 60px; height: 60px;
+      background: linear-gradient(135deg, var(--accent), var(--purple));
+      border-radius: 18px;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 30px;
+      box-shadow: 0 0 30px var(--accent-glow);
+      opacity: .85;
+    }
+
+    .welcome h2 { font-size: 19px; color: var(--text-2); font-weight: 600; }
+    .welcome p  { font-size: 13.5px; max-width: 380px; line-height: 1.65; }
+
+    /* Row */
+    .msg-row {
+      display: flex;
+      gap: 11px;
+      animation: fadeUp .28s ease;
+    }
+    .msg-row.user { flex-direction: row-reverse; }
+
+    @keyframes fadeUp {
+      from { opacity: 0; transform: translateY(10px); }
+      to   { opacity: 1; transform: translateY(0); }
+    }
+
+    .av {
+      width: 30px; height: 30px;
+      border-radius: 8px;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 13px;
+      flex-shrink: 0;
+      margin-top: 3px;
+    }
+    .av-user { background: linear-gradient(135deg, var(--accent), var(--purple)); }
+    .av-ai   { background: var(--surface3); border: 1px solid var(--border); }
+
+    .msg-col {
+      display: flex;
+      flex-direction: column;
+      gap: 7px;
+      max-width: 74%;
+    }
+    .msg-row.user .msg-col { align-items: flex-end; }
+
+    .bubble {
+      padding: 11px 15px;
+      border-radius: var(--r);
+      font-size: 13.5px;
+      line-height: 1.68;
+      word-break: break-word;
+    }
+
+    .msg-row.user .bubble {
+      background: var(--user-grad);
+      border: 1px solid rgba(99,102,241,.3);
+      border-bottom-right-radius: 3px;
+    }
+
+    .msg-row.ai .bubble {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-bottom-left-radius: 3px;
+    }
+
+    /* markdown in bubbles */
+    .bubble p                { margin-bottom: .6em; }
+    .bubble p:last-child     { margin-bottom: 0; }
+    .bubble h1,.bubble h2,.bubble h3 { margin: .8em 0 .35em; color: var(--text); }
+    .bubble code {
+      background: var(--surface3);
+      padding: 1px 5px;
+      border-radius: 4px;
+      font-size: 12px;
+      font-family: 'Cascadia Code','Fira Code',monospace;
+    }
+    .bubble pre {
+      background: #0d1117;
+      border: 1px solid var(--border);
+      border-radius: var(--r-sm);
+      padding: 12px;
+      overflow-x: auto;
+      margin: 8px 0;
+    }
+    .bubble pre code { background: none; padding: 0; font-size: 12.5px; }
+    .bubble ul,.bubble ol { padding-left: 1.4em; margin: .35em 0; }
+    .bubble li { margin: .2em 0; }
+    .bubble blockquote {
+      border-left: 3px solid var(--accent);
+      padding-left: 12px;
+      color: var(--text-2);
+      margin: 8px 0;
+    }
+    .bubble a { color: #a5b4fc; }
+    .bubble strong { color: #c7d2fe; }
+    .bubble table { border-collapse: collapse; width: 100%; margin: 8px 0; font-size: 12.5px; }
+    .bubble th,.bubble td { border: 1px solid var(--border); padding: 5px 10px; }
+    .bubble th { background: var(--surface2); }
+
+    .msg-time { font-size: 10.5px; color: var(--text-3); padding: 0 3px; }
+
+    /* streaming cursor */
+    .cursor {
+      display: inline-block;
+      width: 2px; height: .9em;
+      background: var(--accent);
+      vertical-align: text-bottom;
+      margin-left: 1px;
+      animation: blink 1s step-end infinite;
+    }
+    @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0} }
+
+    /* ── THINKING BLOCK ─────────────────────────────────────────────────── */
+    .think-wrap {
+      background: var(--amber-dim);
+      border: 1px solid var(--amber-border);
+      border-radius: var(--r);
+      overflow: hidden;
+    }
+
+    .think-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 8px 12px;
+      cursor: pointer;
+      user-select: none;
+      transition: background .18s;
+    }
+    .think-header:hover { background: rgba(245,158,11,.06); }
+
+    .think-header-left { display: flex; align-items: center; gap: 7px; }
+    .think-emoji { font-size: 13px; }
+
+    .think-label {
+      font-size: 11px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: .07em;
+      color: var(--amber);
+    }
+
+    .dots {
+      display: flex; gap: 3px; align-items: center;
+    }
+    .dots span {
+      width: 4px; height: 4px;
+      background: var(--amber);
+      border-radius: 50%;
+      animation: dot-bounce 1.4s infinite ease-in-out;
+    }
+    .dots span:nth-child(2) { animation-delay: .2s; }
+    .dots span:nth-child(3) { animation-delay: .4s; }
+
+    @keyframes dot-bounce {
+      0%,80%,100% { transform: scale(.55); opacity: .35; }
+      40%          { transform: scale(1);   opacity: 1;   }
+    }
+
+    .think-chevron {
+      font-size: 11px;
+      color: var(--amber);
+      transition: transform .2s;
+    }
+    .think-wrap.collapsed .think-chevron { transform: rotate(-90deg); }
+
+    .think-tabs {
+      display: flex;
+      padding: 0 12px;
+      gap: 2px;
+      border-bottom: 1px solid var(--amber-border);
+    }
+
+    .think-tab {
+      padding: 5px 10px;
+      font-size: 10.5px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: .05em;
+      color: var(--text-3);
+      cursor: pointer;
+      border-bottom: 2px solid transparent;
+      transition: all .18s;
+    }
+    .think-tab:hover { color: var(--amber); }
+    .think-tab.active { color: var(--amber); border-bottom-color: var(--amber); }
+
+    .think-body {
+      padding: 10px 13px;
+      font-size: 12.5px;
+      line-height: 1.62;
+      color: #c9963f;
+      max-height: 280px;
+      overflow-y: auto;
+    }
+    .think-body.raw {
+      font-family: 'Cascadia Code','Fira Code',monospace;
+      font-size: 12px;
+      color: #7a7a9a;
+      white-space: pre-wrap;
+    }
+
+    .think-wrap.collapsed .think-tabs,
+    .think-wrap.collapsed .think-body { display: none; }
+
+    /* ── INPUT AREA ─────────────────────────────────────────────────────── */
+    #input-area {
+      padding: 14px 22px 18px;
+      border-top: 1px solid var(--border);
+      background: var(--surface);
+      flex-shrink: 0;
+    }
+
+    .gen-bar {
+      display: none;
+      align-items: center;
+      gap: 8px;
+      padding: 7px 11px;
+      background: var(--accent-dim);
+      border: 1px solid rgba(99,102,241,.22);
+      border-radius: var(--r-sm);
+      font-size: 12px;
+      color: #a5b4fc;
+      margin-bottom: 10px;
+      animation: fadeUp .2s ease;
+    }
+    .gen-bar.on { display: flex; }
+
+    .spin {
+      width: 13px; height: 13px;
+      border: 2px solid rgba(99,102,241,.25);
+      border-top-color: var(--accent);
+      border-radius: 50%;
+      animation: spin .7s linear infinite;
+      flex-shrink: 0;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    .btn-stop {
+      margin-left: auto;
+      background: none;
+      border: 1px solid rgba(99,102,241,.35);
+      color: #a5b4fc;
+      font-size: 11px;
+      padding: 3px 8px;
+      border-radius: 4px;
+      cursor: pointer;
+      transition: all .18s;
+    }
+    .btn-stop:hover { border-color: var(--red); color: var(--red); }
+
+    .input-shell {
+      display: flex;
+      align-items: flex-end;
+      gap: 9px;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: var(--r);
+      padding: 9px 11px;
+      transition: border-color .2s, box-shadow .2s;
+    }
+    .input-shell:focus-within {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 3px var(--accent-dim);
+    }
+
+    #inp {
+      flex: 1;
+      background: none;
+      border: none;
+      outline: none;
+      color: var(--text);
+      font-family: inherit;
+      font-size: 13.5px;
+      line-height: 1.5;
+      resize: none;
+      max-height: 150px;
+      min-height: 22px;
+      overflow-y: auto;
+    }
+    #inp::placeholder { color: var(--text-3); }
+
+    .btn-send {
+      width: 33px; height: 33px;
+      background: var(--accent);
+      border: none;
+      border-radius: var(--r-sm);
+      color: #fff;
+      cursor: pointer;
+      display: flex; align-items: center; justify-content: center;
+      flex-shrink: 0;
+      transition: background .18s, transform .1s, box-shadow .18s;
+    }
+    .btn-send:hover:not(:disabled) {
+      background: var(--accent-hi);
+      transform: scale(1.06);
+      box-shadow: 0 0 10px var(--accent-glow);
+    }
+    .btn-send:disabled { background: var(--surface3); color: var(--text-3); cursor: not-allowed; }
+    .btn-send svg { width: 15px; height: 15px; }
+
+    .input-hint { font-size: 10.5px; color: var(--text-3); margin-top: 5px; text-align: right; }
+  </style>
+</head>
+<body>
+
+<!-- ── SIDEBAR ── -->
+<div id="sidebar">
+  <div class="sb-head">
+    <div class="logo">
+      <div class="logo-gem">🧠</div>
+      <span class="logo-name">Qwen3 Chat</span>
+    </div>
+    <span class="status-pill"><span class="dot-live"></span>Qwen3-1.7B · Local</span>
+  </div>
+
+  <div class="sb-body">
+
+    <div class="ctrl-group">
+      <div class="ctrl-label">System Prompt</div>
+      <textarea class="sys-prompt" id="sysPrompt">You are a helpful assistant.</textarea>
+    </div>
+
+    <div class="ctrl-group">
+      <div class="ctrl-label">Sampling Parameters</div>
+
+      <div class="slider-row">
+        <div class="slider-top">
+          <span class="slider-name">Temperature</span>
+          <span class="slider-val" id="tempV">0.70</span>
+        </div>
+        <input type="range" id="temp" min="0" max="2" step="0.05" value="0.7">
+      </div>
+
+      <div class="slider-row">
+        <div class="slider-top">
+          <span class="slider-name">Top-P</span>
+          <span class="slider-val" id="topPV">0.90</span>
+        </div>
+        <input type="range" id="topP" min="0.01" max="1" step="0.01" value="0.9">
+      </div>
+
+      <div class="slider-row">
+        <div class="slider-top">
+          <span class="slider-name">Top-K</span>
+          <span class="slider-val" id="topKV">50</span>
+        </div>
+        <input type="range" id="topK" min="1" max="200" step="1" value="50">
+      </div>
+
+      <div class="slider-row">
+        <div class="slider-top">
+          <span class="slider-name">Max Tokens</span>
+          <span class="slider-val" id="maxTokV">1024</span>
+        </div>
+        <input type="range" id="maxTok" min="64" max="4096" step="64" value="1024">
+      </div>
+    </div>
+
+    <div class="ctrl-group">
+      <div class="ctrl-label">Reasoning</div>
+      <div class="toggle-row">
+        <div class="toggle-info">
+          <span class="toggle-title">Chain of Thought</span>
+          <span class="toggle-sub">Show model reasoning steps</span>
+        </div>
+        <label class="switch">
+          <input type="checkbox" id="thinkToggle" checked>
+          <span class="switch-track"></span>
+        </label>
+      </div>
+    </div>
+
+  </div>
+
+  <div class="sb-foot">
+    <button class="btn-clear" id="clearBtn">🗑&nbsp; Clear conversation</button>
+  </div>
+</div>
+
+<!-- ── MAIN ── -->
+<div id="main">
+  <div class="chat-header">
+    <div>
+      <div class="header-title">Local AI · Qwen3-1.7B</div>
+      <div class="header-sub">RTX 2050 · 4-bit quantized · no internet</div>
+    </div>
+    <div class="vram-pill" id="vramPill">VRAM —</div>
+  </div>
+
+  <div id="messages">
+    <div class="welcome" id="welcome">
+      <div class="welcome-icon">🧠</div>
+      <h2>Qwen3-1.7B</h2>
+      <p>Running entirely on your machine. Nothing leaves your computer. Tune parameters in the sidebar and start a conversation.</p>
+    </div>
+  </div>
+
+  <div id="input-area">
+    <div class="gen-bar" id="genBar">
+      <div class="spin"></div>
+      <span id="genStatus">Generating…</span>
+      <button class="btn-stop" id="stopBtn">■ Stop</button>
+    </div>
+    <div class="input-shell">
+      <textarea id="inp" rows="1" placeholder="Message Qwen3…"></textarea>
+      <button class="btn-send" id="sendBtn">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"
+             stroke-linecap="round" stroke-linejoin="round">
+          <line x1="22" y1="2" x2="11" y2="13"/>
+          <polygon points="22 2 15 22 11 13 2 9 22 2"/>
+        </svg>
+      </button>
+    </div>
+    <div class="input-hint">Enter to send &nbsp;·&nbsp; Shift+Enter for new line</div>
+  </div>
+</div>
+
+<script>
+  // ── SETUP ───────────────────────────────────────────────────────────────────
+  const $ = id => document.getElementById(id);
+  const el = {
+    messages:    $('messages'),
+    welcome:     $('welcome'),
+    inp:         $('inp'),
+    sendBtn:     $('sendBtn'),
+    stopBtn:     $('stopBtn'),
+    clearBtn:    $('clearBtn'),
+    sysPrompt:   $('sysPrompt'),
+    temp:        $('temp'),   tempV:    $('tempV'),
+    topP:        $('topP'),   topPV:    $('topPV'),
+    topK:        $('topK'),   topKV:    $('topKV'),
+    maxTok:      $('maxTok'), maxTokV:  $('maxTokV'),
+    thinkToggle: $('thinkToggle'),
+    genBar:      $('genBar'),
+    genStatus:   $('genStatus'),
+    vramPill:    $('vramPill'),
+  };
+
+  let history = [];
+  let controller = null;
+  let busy = false;
+
+  // ── MARKED ──────────────────────────────────────────────────────────────────
+  if (typeof marked !== 'undefined') {
+    marked.setOptions({ breaks: true, gfm: true });
+  }
+
+  function md(text) {
+    if (!text) return '';
+    try { return marked.parse(text); } catch { return esc(text).replace(/\n/g,'<br>'); }
+  }
+
+  function esc(t) {
+    return t.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  }
+
+  function highlight(root) {
+    if (typeof hljs === 'undefined') return;
+    root.querySelectorAll('pre code:not([data-hl])').forEach(el => {
+      hljs.highlightElement(el);
+      el.dataset.hl = '1';
+    });
+  }
+
+  // ── SLIDERS ─────────────────────────────────────────────────────────────────
+  el.temp.addEventListener('input',   () => el.tempV.textContent   = (+el.temp.value).toFixed(2));
+  el.topP.addEventListener('input',   () => el.topPV.textContent   = (+el.topP.value).toFixed(2));
+  el.topK.addEventListener('input',   () => el.topKV.textContent   = el.topK.value);
+  el.maxTok.addEventListener('input', () => el.maxTokV.textContent = el.maxTok.value);
+
+  // ── TEXTAREA AUTO-RESIZE ────────────────────────────────────────────────────
+  el.inp.addEventListener('input', () => {
+    el.inp.style.height = 'auto';
+    el.inp.style.height = Math.min(el.inp.scrollHeight, 150) + 'px';
+  });
+
+  el.inp.addEventListener('keydown', e => {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); if (!busy) send(); }
+  });
+
+  el.sendBtn.addEventListener('click', () => { if (!busy) send(); });
+  el.stopBtn.addEventListener('click', () => { if (controller) controller.abort(); });
+
+  el.clearBtn.addEventListener('click', () => {
+    history = [];
+    el.messages.innerHTML = '';
+    el.messages.appendChild(el.welcome);
+    el.welcome.style.display = '';
+  });
+
+  // ── HELPERS ─────────────────────────────────────────────────────────────────
+  function scrollEnd() { el.messages.scrollTop = el.messages.scrollHeight; }
+  function now()       { return new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'}); }
+
+  function setBusy(state) {
+    busy = state;
+    el.sendBtn.disabled = state;
+    el.genBar.classList.toggle('on', state);
+    if (!state) el.genStatus.textContent = 'Generating…';
+  }
+
+  // ── USER BUBBLE ─────────────────────────────────────────────────────────────
+  function addUser(text) {
+    el.welcome.style.display = 'none';
+    const row = document.createElement('div');
+    row.className = 'msg-row user';
+    row.innerHTML = `
+      <div class="av av-user">👤</div>
+      <div class="msg-col">
+        <div class="bubble">${esc(text).replace(/\n/g,'<br>')}</div>
+        <div class="msg-time">${now()}</div>
+      </div>`;
+    el.messages.appendChild(row);
+    scrollEnd();
+  }
+
+  // ── AI BUBBLE ───────────────────────────────────────────────────────────────
+  function addAI() {
+    const row = document.createElement('div');
+    row.className = 'msg-row ai';
+
+    // Thinking block
+    const think = document.createElement('div');
+    think.className = 'think-wrap';
+    think.style.display = 'none';
+    think.innerHTML = `
+      <div class="think-header">
+        <div class="think-header-left">
+          <span class="think-emoji">⚡</span>
+          <span class="think-label">Chain of Thought</span>
+          <div class="dots"><span></span><span></span><span></span></div>
+        </div>
+        <span class="think-chevron">▼</span>
+      </div>
+      <div class="think-tabs">
+        <div class="think-tab active" data-t="rendered">Rendered</div>
+        <div class="think-tab" data-t="raw">Raw</div>
+      </div>
+      <div class="think-body rendered-view"></div>`;
+
+    // Response bubble
+    const bubble = document.createElement('div');
+    bubble.className = 'bubble';
+    bubble.innerHTML = '<span class="cursor"></span>';
+
+    const timeEl = document.createElement('div');
+    timeEl.className = 'msg-time';
+    timeEl.textContent = now();
+
+    const col = document.createElement('div');
+    col.className = 'msg-col';
+    col.appendChild(think);
+    col.appendChild(bubble);
+    col.appendChild(timeEl);
+
+    row.innerHTML = `<div class="av av-ai">🤖</div>`;
+    row.appendChild(col);
+    el.messages.appendChild(row);
+    scrollEnd();
+
+    // Think header toggle
+    think.querySelector('.think-header').addEventListener('click', () => {
+      think.classList.toggle('collapsed');
+    });
+
+    // Tab switching
+    think.querySelectorAll('.think-tab').forEach(tab => {
+      tab.addEventListener('click', e => {
+        e.stopPropagation();
+        think.querySelectorAll('.think-tab').forEach(t => t.classList.remove('active'));
+        tab.classList.add('active');
+        renderThinkView(think, tab.dataset.t);
+      });
+    });
+
+    return { think, bubble };
+  }
+
+  function renderThinkView(think, which) {
+    const body = think.querySelector('.think-body');
+    const raw  = think.dataset.raw  || '';
+    const rend = think.dataset.rend || '';
+    if (which === 'raw') {
+      body.classList.add('raw');
+      body.textContent = `<think>\n${raw}\n</think>`;
+    } else {
+      body.classList.remove('raw');
+      body.innerHTML = rend;
+    }
+  }
+
+  // ── SEND ────────────────────────────────────────────────────────────────────
+  async function send() {
+    const text = el.inp.value.trim();
+    if (!text) return;
+
+    el.inp.value = '';
+    el.inp.style.height = 'auto';
+
+    addUser(text);
+    history.push({ role: 'user', content: text });
+
+    setBusy(true);
+    const { think, bubble } = addAI();
+    controller = new AbortController();
+
+    let thinkRaw = '';
+    let responseText = '';
+
+    try {
+      const res = await fetch('/chat/stream', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          messages:         history,
+          system_prompt:    el.sysPrompt.value,
+          temperature:      +el.temp.value,
+          top_p:            +el.topP.value,
+          top_k:            +el.topK.value,
+          max_new_tokens:   +el.maxTok.value,
+          enable_thinking:  el.thinkToggle.checked,
+        }),
+        signal: controller.signal,
+      });
+
+      const reader  = res.body.getReader();
+      const decoder = new TextDecoder();
+      let   sseBuf  = '';
+
+      el.genStatus.textContent = 'Thinking…';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        sseBuf += decoder.decode(value, { stream: true });
+        const lines = sseBuf.split('\n');
+        sseBuf = lines.pop();
+
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue;
+          let evt;
+          try { evt = JSON.parse(line.slice(6)); } catch { continue; }
+
+          if (evt.type === 'thinking_start') {
+            think.style.display = 'block';
+            el.genStatus.textContent = 'Thinking…';
+
+          } else if (evt.type === 'thinking') {
+            thinkRaw += evt.content;
+            const rendered = md(thinkRaw);
+            think.dataset.raw  = thinkRaw;
+            think.dataset.rend = rendered;
+            const activeTab = think.querySelector('.think-tab.active').dataset.t;
+            renderThinkView(think, activeTab);
+            scrollEnd();
+
+          } else if (evt.type === 'thinking_end') {
+            think.querySelector('.dots').style.display = 'none';
+            think.classList.add('collapsed');
+            el.genStatus.textContent = 'Responding…';
+
+          } else if (evt.type === 'response') {
+            responseText += evt.content;
+            bubble.innerHTML = md(responseText) + '<span class="cursor"></span>';
+            highlight(bubble);
+            scrollEnd();
+
+          } else if (evt.type === 'done') {
+            bubble.innerHTML = md(responseText) || '<span style="color:var(--text-3)">…</span>';
+            highlight(bubble);
+            history.push({ role: 'assistant', content: responseText });
+            setBusy(false);
+            updateVram();
+
+          } else if (evt.type === 'error') {
+            bubble.innerHTML = `<span style="color:var(--red)">⚠ ${esc(evt.content)}</span>`;
+            setBusy(false);
+          }
+        }
+      }
+
+    } catch (err) {
+      if (err.name !== 'AbortError') {
+        bubble.innerHTML = `<span style="color:var(--red)">⚠ Connection error. Is the server running?</span>`;
+      } else {
+        bubble.innerHTML = md(responseText) || '<span style="color:var(--text-3)">Stopped.</span>';
+        if (responseText) history.push({ role: 'assistant', content: responseText });
+      }
+      setBusy(false);
+    }
+  }
+
+  // ── VRAM POLL ───────────────────────────────────────────────────────────────
+  async function updateVram() {
+    try {
+      const d = await (await fetch('/vram')).json();
+      el.vramPill.textContent = `VRAM ${d.used_gb.toFixed(2)} / ${d.total_gb.toFixed(1)} GB`;
+    } catch {}
+  }
+
+  updateVram();
+  setInterval(updateVram, 8000);
+</script>
+</body>
+</html>
