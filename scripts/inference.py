@@ -1,20 +1,15 @@
 """
-Inference engine for the trained GPT model.
+HAVOC inference engine.
 
-Handles model loading, tokenisation, and token-by-token streaming generation
-with full sampling control: temperature, top-k, top-p (nucleus), repetition
-penalty, and greedy decoding.
+Loads a checkpoint produced by pretrain.py / sft.py and exposes a
+streaming generation interface. Three modes:
 
-This module is imported by gui_app.py but can also be used standalone:
+  - generate_stream()              token-by-token streaming (default)
+  - generate_with_refinement()     iterative self-refinement (refinement.py)
+  - generate_with_orchestration()  full agent + tool pipeline (orchestrator.py)
 
-    from inference import InferenceEngine
-    engine = InferenceEngine()
-    engine.load_model("models/checkpoints/best.pt")
-
-    for token, done, stats in engine.generate_stream("Once upon a time", max_new_tokens=200):
-        print(token, end="", flush=True)
-        if done:
-            break
+The streaming interface is deliberately stable - gui_app.py and chat_ui
+both consume `(token_text, is_done, GenStats)` tuples.
 """
 
 from __future__ import annotations
@@ -23,73 +18,46 @@ import os
 import sys
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
 
-# ── Import model architecture from train.py ───────────────────────────────────
-# train.py has no side-effects at import time (training code is under
-# `if __name__ == "__main__"`) so this is safe.
-_SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, _SCRIPTS_DIR)
+_HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, _HERE)
 
-from train import Config, GPT  # noqa: E402
-
-# ── Optional: HuggingFace tokenizer ───────────────────────────────────────────
-try:
-    from transformers import GPT2TokenizerFast
-    _HAS_TOKENIZER = True
-except ImportError:
-    _HAS_TOKENIZER = False
+from config           import HavocConfig                  # noqa: E402
+from model            import HavocModel                   # noqa: E402
+from tokenizer_havoc  import HavocTokenizer               # noqa: E402
 
 
-# ---------------------------------------------------------------------------
-# Sampling helpers  (static, pure-function style for testability)
-# ---------------------------------------------------------------------------
+# ── sampling helpers ──────────────────────────────────────────────────────
+
 
 def _top_k_filter(logits: torch.Tensor, k: int) -> torch.Tensor:
-    """Zero out all logits outside the top-k."""
     if k <= 0:
         return logits
     k = min(k, logits.size(-1))
     values, _ = torch.topk(logits, k)
-    threshold  = values[:, -1].unsqueeze(-1)
-    logits     = logits.masked_fill(logits < threshold, -float("inf"))
-    return logits
+    threshold = values[:, -1].unsqueeze(-1)
+    return logits.masked_fill(logits < threshold, -float("inf"))
 
 
 def _top_p_filter(logits: torch.Tensor, p: float) -> torch.Tensor:
-    """
-    Nucleus (top-p) sampling filter.
-
-    Keeps the smallest set of tokens whose cumulative probability ≥ p and
-    zeroes out the rest.  Always keeps at least 1 token.
-    """
     if p >= 1.0:
         return logits
-    probs                       = F.softmax(logits, dim=-1)
-    sorted_probs, sorted_idx    = torch.sort(probs, dim=-1, descending=True)
-    cumulative                  = torch.cumsum(sorted_probs, dim=-1)
-    # Shift right by 1: we want to *include* the token that pushes us over p
-    remove                      = (cumulative - sorted_probs) > p
-    sorted_probs[remove]        = 0.0
-    # Scatter back to original vocabulary order
+    probs                    = F.softmax(logits, dim=-1)
+    sorted_probs, sorted_idx = torch.sort(probs, dim=-1, descending=True)
+    cumulative               = torch.cumsum(sorted_probs, dim=-1)
+    remove                   = (cumulative - sorted_probs) > p
+    sorted_probs[remove]     = 0.0
     probs = torch.zeros_like(logits).scatter_(-1, sorted_idx, sorted_probs)
-    # Replace original logits so downstream code can use softmax or multinomial
-    logits = logits.masked_fill(probs == 0.0, -float("inf"))
-    return logits
+    return logits.masked_fill(probs == 0.0, -float("inf"))
 
 
 def _repetition_penalty(logits: torch.Tensor,
-                         generated: torch.Tensor,
-                         penalty: float) -> torch.Tensor:
-    """
-    Penalise tokens that have already appeared in the context.
-
-    Positive logits are divided by `penalty`; negative logits are multiplied.
-    penalty=1.0 → no effect.
-    """
+                        generated: torch.Tensor,
+                        penalty: float) -> torch.Tensor:
     if abs(penalty - 1.0) < 1e-6:
         return logits
     for tok_id in generated.unique():
@@ -100,16 +68,15 @@ def _repetition_penalty(logits: torch.Tensor,
     return logits
 
 
-# ---------------------------------------------------------------------------
-# Generation statistics
-# ---------------------------------------------------------------------------
+# ── Stats ─────────────────────────────────────────────────────────────────
+
 
 @dataclass
 class GenStats:
     n_tokens:    int   = 0
     elapsed_s:   float = 0.0
     tok_per_sec: float = 0.0
-    status:      str   = "idle"   # "running" | "done" | "stopped" | "error"
+    status:      str   = "idle"
 
     def update(self, n_tokens: int, t_start: float, status: str = "running") -> None:
         self.n_tokens    = n_tokens
@@ -118,66 +85,34 @@ class GenStats:
         self.status      = status
 
 
-# ---------------------------------------------------------------------------
-# Inference engine
-# ---------------------------------------------------------------------------
+# ── Engine ────────────────────────────────────────────────────────────────
+
 
 class InferenceEngine:
-    """
-    Loads a checkpoint produced by train.py and exposes a streaming
-    generation interface.
-
-    Usage
-    -----
-        engine = InferenceEngine()
-        info   = engine.load_model("models/checkpoints/best.pt")
-
-        stop = threading.Event()
-        for tok, done, stats in engine.generate_stream(
-            prompt="What is gravity?",
-            max_new_tokens=200,
-            temperature=0.8,
-            top_k=40,
-            top_p=0.9,
-            stop_event=stop,
-        ):
-            print(tok, end="", flush=True)
-            if done:
-                break
-    """
+    """Loads a HAVOC checkpoint and streams generated text."""
 
     def __init__(self) -> None:
-        self.model:      GPT | None   = None
-        self.tokenizer                 = None
-        self.device:     str          = "cpu"
-        self.model_cfg:  Config | None = None
-        self.ckpt_meta:  dict         = {}
-        self.loaded:     bool         = False
+        self.model:      HavocModel | None      = None
+        self.tokenizer:  HavocTokenizer | None  = None
+        self.cfg:        HavocConfig | None     = None
+        self.device:     str                    = "cpu"
+        self.ckpt_meta:  dict                   = {}
+        self.loaded:     bool                   = False
+        self._system_prompt: str                = ""
 
-        # Special token IDs populated after load
-        self._eot_id:        int | None = None
-        self._think_id:      int | None = None
-        self._end_think_id:  int | None = None
-        self._sep_id:        int | None = None
+        # Lazy: refinement / orchestration engines (built on demand)
+        self._refiner    = None
+        self._orchestrator = None
 
-        # System prompt — applied to every generate_stream() call
-        self._system_prompt: str = ""
-
-    # ── System prompt ─────────────────────────────────────────────────────────
+    # ── system prompt ────────────────────────────────────────────────────
 
     def set_system_prompt(self, text: str) -> None:
-        """Set the system prompt string directly."""
         self._system_prompt = text.strip()
 
     def get_system_prompt(self) -> str:
-        """Return the current system prompt."""
         return self._system_prompt
 
     def load_system_prompt(self, path: str) -> str:
-        """
-        Load the system prompt from a text file.
-        Returns the loaded text.  Silently keeps the previous prompt on error.
-        """
         try:
             with open(path, encoding="utf-8") as f:
                 self._system_prompt = f.read().strip()
@@ -186,133 +121,90 @@ class InferenceEngine:
         return self._system_prompt
 
     def save_system_prompt(self, path: str) -> None:
-        """Persist the current system prompt to a text file."""
         with open(path, "w", encoding="utf-8") as f:
             f.write(self._system_prompt)
 
-    # ── Model loading ──────────────────────────────────────────────────────────
+    # ── model loading ────────────────────────────────────────────────────
 
-    def load_model(self, ckpt_path: str) -> dict:
-        """
-        Load a checkpoint file.  Returns a metadata dict with model info.
-
-        Works with both raw checkpoints and checkpoints from torch.compile()
-        (which prefix state-dict keys with "_orig_mod.").
-        """
-        self.loaded = False
+    def load_model(self,
+                   ckpt_path:     str,
+                   tokenizer_dir: str | None = None,
+                   ) -> dict:
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
-        ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+        ck = torch.load(ckpt_path, map_location=device, weights_only=False)
+        # Reconstruct config from checkpoint, dropping fields HavocConfig doesn't know
+        valid = {f.name for f in HavocConfig.__dataclass_fields__.values()}
+        cfg_kwargs = {k: v for k, v in ck.get("cfg", {}).items() if k in valid}
+        cfg = HavocConfig(**cfg_kwargs)
+        cfg.gradient_checkpointing = False
+        cfg.dropout                = 0.0
 
-        # ── Reconstruct Config from saved cfg ─────────────────────────────────
-        saved_cfg   = ckpt.get("cfg", {})
-        model_cfg   = Config()
-
-        # Copy only recognised model fields; skip device/path fields
-        _skip = {"processed_dir", "ckpt_dir", "log_dir", "device"}
-        for k, v in saved_cfg.items():
-            if k not in _skip and hasattr(model_cfg, k):
-                setattr(model_cfg, k, v)
-
-        # Inference overrides
-        model_cfg.gradient_checkpointing = False
-        model_cfg.dropout                = 0.0
-        model_cfg.device                 = device
-
-        # ── Build model and load weights ───────────────────────────────────────
-        model = GPT(model_cfg).to(device)
+        # Build model and load weights
+        model = HavocModel(cfg).to(device)
         model.eval()
-
-        state_dict = ckpt["model"]
-        # Strip torch.compile prefix if present
-        state_dict = {
-            k.replace("_orig_mod.", ""): v
-            for k, v in state_dict.items()
-        }
-        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        sd = {k.replace("_orig_mod.", ""): v for k, v in ck["model"].items()}
+        missing, unexpected = model.load_state_dict(sd, strict=False)
         if missing:
             print(f"  [inference] Missing keys  : {missing[:5]}")
         if unexpected:
             print(f"  [inference] Unexpected keys: {unexpected[:5]}")
 
-        # ── Tokenizer ──────────────────────────────────────────────────────────
+        # Load tokenizer
+        # 1) explicit arg, 2) checkpoint metadata, 3) default location
+        tok_dir = tokenizer_dir or ck.get("tokenizer_dir") or "models/tokenizers/havoc_bpe"
         tokenizer = None
-        if _HAS_TOKENIZER:
-            try:
-                tokenizer = GPT2TokenizerFast.from_pretrained("gpt2")
-                tokenizer.add_special_tokens({
-                    "additional_special_tokens": [
-                        "<|sep|>", "<|think|>", "<|/think|>",
-                        "<|system|>", "<|/system|>",
-                        "<|user|>", "<|/user|>", "<|assistant|>",
-                    ]
-                })
-            except Exception as exc:
-                print(f"  [inference] Tokenizer load failed: {exc}")
+        if os.path.isfile(os.path.join(tok_dir, "tokenizer.json")):
+            tokenizer = HavocTokenizer.from_pretrained(tok_dir)
+        else:
+            print(f"  [inference] WARN: no tokenizer at {tok_dir} - decoding will show ids")
 
         self.model     = model
         self.tokenizer = tokenizer
+        self.cfg       = cfg
         self.device    = device
-        self.model_cfg = model_cfg
         self.loaded    = True
 
-        # ── Resolve special token IDs ──────────────────────────────────────────
-        if tokenizer is not None:
-            self._eot_id       = tokenizer.eos_token_id
-            self._sep_id       = tokenizer.convert_tokens_to_ids("<|sep|>")
-            self._think_id     = tokenizer.convert_tokens_to_ids("<|think|>")
-            self._end_think_id = tokenizer.convert_tokens_to_ids("<|/think|>")
-        else:
-            self._eot_id = 50256
-
-        # ── Metadata ───────────────────────────────────────────────────────────
-        n_unique = sum(p.numel() for p in set(model.parameters()))
+        n_unique = sum(p.numel() for p in {id(p): p for p in model.parameters()}.values())
         self.ckpt_meta = {
             "path":       ckpt_path,
             "device":     device,
             "n_params":   n_unique,
-            "epoch":      ckpt.get("epoch", "?"),
-            "step":       ckpt.get("step", "?"),
-            "val_loss":   ckpt.get("val_loss", float("nan")),
-            "vocab_size": model_cfg.vocab_size,
-            "block_size": model_cfg.block_size,
-            "n_layer":    model_cfg.n_layer,
-            "n_head":     model_cfg.n_head,
-            "n_embd":     model_cfg.n_embd,
+            "epoch":      ck.get("epoch", "?"),
+            "step":       ck.get("step", "?"),
+            "val_loss":   ck.get("val_loss", float("nan")),
+            "vocab_size": cfg.vocab_size,
+            "max_seq_len": cfg.max_seq_len,
+            "num_layers":  cfg.num_layers,
+            "num_heads":   cfg.num_heads,
+            "hidden_size": cfg.hidden_size,
         }
+        # Reset wrapped engines so they pick up the new model
+        self._refiner = None
+        self._orchestrator = None
         return self.ckpt_meta
 
-    # ── Generation ─────────────────────────────────────────────────────────────
+    # ── core streaming generation ────────────────────────────────────────
 
     def generate_stream(
         self,
         prompt:             str,
-        max_new_tokens:     int            = 300,
-        temperature:        float          = 0.8,
-        top_k:              int            = 40,
-        top_p:              float          = 0.9,
-        repetition_penalty: float          = 1.1,
-        sampling_mode:      str            = "top_kp",   # top_kp|top_k|top_p|greedy
-        use_cot:            bool           = False,
+        max_new_tokens:     int           = 300,
+        temperature:        float         = 0.8,
+        top_k:              int           = 40,
+        top_p:              float         = 0.9,
+        repetition_penalty: float         = 1.1,
+        sampling_mode:      str           = "top_kp",   # top_kp|top_k|top_p|greedy
         stop_event:         threading.Event | None = None,
+        wrap_chat:          bool          = True,
+        cot:                bool          = False,
     ):
         """
-        Streaming token generator.
+        Yields (token_text: str, is_done: bool, stats: GenStats).
 
-        Yields
-        ------
-        (token_text : str,  is_done : bool,  stats : GenStats)
-
-        token_text  — decoded text of the new token (empty string on final yield)
-        is_done     — True on the final yield only
-        stats       — live GenStats object (same object mutated each step)
-
-        Sampling modes
-        --------------
-        "top_kp"  — top-k filter THEN top-p filter (recommended)
-        "top_k"   — top-k filter only
-        "top_p"   — top-p filter only
-        "greedy"  — argmax, ignores temperature / top-k / top-p
+        wrap_chat=True (default) wraps the prompt in the HAVOC chat template
+        using the configured system prompt. Pass wrap_chat=False when you've
+        already crafted the full prompt (the refinement scaffold does this).
         """
         if not self.loaded or self.model is None:
             yield ("", True, GenStats(status="error"))
@@ -321,112 +213,92 @@ class InferenceEngine:
         model     = self.model
         tokenizer = self.tokenizer
         device    = self.device
-        cfg       = self.model_cfg
+        cfg       = self.cfg
         stats     = GenStats()
         t_start   = time.perf_counter()
 
-        # ── Encode prompt (with optional system prompt prefix) ─────────────────
+        # Encode
         if tokenizer is not None:
-            if self._system_prompt:
-                full_prompt = (
-                    f"<|system|>{self._system_prompt}<|/system|>"
-                    f"<|user|>{prompt}<|/user|><|assistant|>"
-                )
+            if wrap_chat:
+                messages = []
+                if self._system_prompt:
+                    messages.append({"role": "system", "content": self._system_prompt})
+                messages.append({"role": "user", "content": prompt})
+                enc = tokenizer.encode_chat(messages, add_generation_prompt=True)
             else:
-                full_prompt = prompt
-            enc = tokenizer.encode(full_prompt, add_special_tokens=False)
+                enc = tokenizer.encode(prompt, add_special=False)
             if not enc:
-                enc = [self._eot_id or 50256]
+                enc = [tokenizer.eos_token_id]
+            # CoT mode: nudge the model into reasoning by appending <|think|>
+            # so the next generated tokens are inside the thinking block until
+            # <|/think|> is emitted.
+            if cot:
+                enc = list(enc) + [tokenizer.think_token_id]
+            eos_id = tokenizer.eos_token_id
+            asst_close_id = tokenizer.end_assistant_token_id
         else:
-            enc = [self._eot_id or 50256]
-
-        # Inject CoT opening token if requested
-        if use_cot and self._think_id is not None:
-            enc = enc + [self._think_id]
+            enc           = [0]
+            eos_id        = 0
+            asst_close_id = None
 
         idx = torch.tensor([enc], dtype=torch.long, device=device)
-
         generated_ids: list[int] = []
-        use_amp = (device == "cuda")
-        amp_dtype = cfg.dtype if hasattr(cfg, "dtype") else torch.bfloat16
+        amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+        use_amp   = (device == "cuda")
 
-        # ── Token-by-token generation ──────────────────────────────────────────
         with torch.no_grad():
             for _ in range(max_new_tokens):
-
-                # ── Stop signal ────────────────────────────────────────────────
                 if stop_event is not None and stop_event.is_set():
                     stats.update(len(generated_ids), t_start, "stopped")
                     yield ("", True, stats)
                     return
 
-                # ── Forward pass ────────────────────────────────────────────────
-                idx_cond = idx[:, -cfg.block_size:]
+                ctx = idx[:, -cfg.max_seq_len:]
                 with torch.amp.autocast(device, dtype=amp_dtype, enabled=use_amp):
-                    logits, _ = model(idx_cond)
+                    logits, _ = model(ctx)
+                logits = logits[:, -1, :].float()
 
-                logits = logits[:, -1, :].float()    # (1, vocab) in fp32
-
-                # ── Greedy shortcut ────────────────────────────────────────────
                 if sampling_mode == "greedy":
                     next_id = logits.argmax(dim=-1, keepdim=True)
-
                 else:
-                    # Temperature scaling
                     if temperature > 0:
-                        logits = logits / max(temperature, 1e-8)
-
-                    # Repetition penalty
+                        logits = logits / max(temperature, 1.0e-8)
                     if generated_ids:
                         past = torch.tensor([generated_ids], device=device)
                         logits = _repetition_penalty(logits, past, repetition_penalty)
-
-                    # Sampling filters
                     if sampling_mode in ("top_k", "top_kp") and top_k > 0:
                         logits = _top_k_filter(logits, top_k)
-
                     if sampling_mode in ("top_p", "top_kp") and top_p < 1.0:
                         logits = _top_p_filter(logits, top_p)
-
-                    # Sample from resulting distribution
-                    probs   = F.softmax(logits, dim=-1)
-                    # Guard against all-zero rows (extreme filtering)
+                    probs = F.softmax(logits, dim=-1)
                     if probs.sum() < 1e-8:
                         probs = torch.ones_like(probs) / probs.size(-1)
                     next_id = torch.multinomial(probs, num_samples=1)
 
                 tok_id = next_id.item()
-
-                # ── Stop at end-of-text ────────────────────────────────────────
-                if self._eot_id is not None and tok_id == self._eot_id:
+                if tok_id == eos_id:
                     stats.update(len(generated_ids), t_start, "eot")
+                    yield ("", True, stats)
+                    return
+                if asst_close_id is not None and tok_id == asst_close_id:
+                    stats.update(len(generated_ids), t_start, "asst_close")
                     yield ("", True, stats)
                     return
 
                 generated_ids.append(tok_id)
                 idx = torch.cat([idx, next_id], dim=1)
 
-                # ── Decode token to text ───────────────────────────────────────
-                if tokenizer is not None:
-                    tok_text = tokenizer.decode(
-                        [tok_id], skip_special_tokens=False
-                    )
-                else:
-                    tok_text = f"[{tok_id}]"
-
+                tok_text = (tokenizer.decode([tok_id], skip_special_tokens=False)
+                            if tokenizer is not None else f"[{tok_id}]")
                 stats.update(len(generated_ids), t_start, "running")
                 yield (tok_text, False, stats)
 
         stats.update(len(generated_ids), t_start, "max_tokens")
         yield ("", True, stats)
 
-    # ── Convenience: non-streaming full generation ─────────────────────────────
+    # ── convenience: full text in one shot ────────────────────────────────
 
     def generate(self, prompt: str, **kwargs) -> str:
-        """
-        Blocking full-string generation.  Returns the complete generated text.
-        Useful for testing outside the GUI.
-        """
         parts: list[str] = []
         for tok, done, _ in self.generate_stream(prompt, **kwargs):
             if tok:
@@ -434,3 +306,130 @@ class InferenceEngine:
             if done:
                 break
         return "".join(parts)
+
+    # ── refinement mode ──────────────────────────────────────────────────
+
+    def _refiner_engine(self):
+        if self._refiner is None:
+            from refinement import RefinementEngine
+            self._refiner = RefinementEngine(
+                engine                = _BareStreamingAdapter(self),
+                max_passes            = self.cfg.refinement_max_passes if self.cfg else 10,
+                confidence_threshold  = (self.cfg.refinement_confidence_threshold
+                                         if self.cfg else 0.85),
+                similarity_threshold  = (self.cfg.refinement_similarity_threshold
+                                         if self.cfg else 0.9),
+            )
+        return self._refiner
+
+    def generate_with_refinement(self, prompt: str):
+        """Yield refinement events. See refinement.py for event schema."""
+        if not self.loaded:
+            yield {"type": "error", "content": "model not loaded"}
+            return
+        ref = self._refiner_engine()
+        yield from ref.stream(prompt, system_prompt=self._system_prompt)
+
+    # ── orchestration mode ──────────────────────────────────────────────
+
+    def _orchestrator(self):
+        if self._orchestrator is None:
+            from orchestrator import Orchestrator
+            self._orchestrator = Orchestrator.from_engine(self)
+        return self._orchestrator
+
+    def generate_with_orchestration(self, prompt: str, **kwargs):
+        """Yield orchestrator events. See orchestrator.py for schema."""
+        if not self.loaded:
+            yield {"type": "error", "content": "model not loaded"}
+            return
+        orch = self._orchestrator()
+        yield from orch.stream(prompt, system_prompt=self._system_prompt, **kwargs)
+
+
+# ── Adapter so refinement always sees a 'wrap_chat=False' channel ──────
+
+
+class _BareStreamingAdapter:
+    """
+    Refinement scaffolds construct entire prompts by hand (system + chat markers
+    are baked into the scaffold text). We must therefore tell the underlying
+    engine NOT to re-wrap the prompt in another chat template.
+    """
+
+    def __init__(self, engine: InferenceEngine):
+        self.engine = engine
+
+    def generate_stream(self, prompt: str, **kwargs):
+        kwargs.setdefault("wrap_chat", False)
+        yield from self.engine.generate_stream(prompt, **kwargs)
+
+    def set_system_prompt(self, text: str) -> None:
+        self.engine.set_system_prompt(text)
+
+
+# ── CLI ────────────────────────────────────────────────────────────────────
+
+
+if __name__ == "__main__":
+    import argparse
+    p = argparse.ArgumentParser(description="HAVOC inference (streaming).")
+    p.add_argument("--ckpt",          required=True)
+    p.add_argument("--tokenizer_dir", default=None)
+    p.add_argument("--prompt",        required=True)
+    p.add_argument("--system_prompt", default="")
+    p.add_argument("--max_new_tokens", type=int, default=200)
+    p.add_argument("--temperature",   type=float, default=0.8)
+    p.add_argument("--top_k",         type=int, default=40)
+    p.add_argument("--top_p",         type=float, default=0.9)
+    p.add_argument("--refine",        action="store_true",
+                   help="Use iterative self-refinement (refinement.py).")
+    p.add_argument("--orchestrate",   action="store_true",
+                   help="Use the full agent + tool orchestrator.")
+    args = p.parse_args()
+
+    eng = InferenceEngine()
+    meta = eng.load_model(args.ckpt, tokenizer_dir=args.tokenizer_dir)
+    if args.system_prompt:
+        eng.set_system_prompt(args.system_prompt)
+
+    print(f"\nLoaded {meta['n_params']:,} params from {meta['path']}")
+    print(f"Layers/Heads/Hidden = {meta['num_layers']}/{meta['num_heads']}/{meta['hidden_size']}")
+
+    if args.refine:
+        print("\n=== REFINEMENT MODE ===\n")
+        for ev in eng.generate_with_refinement(args.prompt):
+            t = ev["type"]
+            if t == "pass_start":
+                print(f"\n--- Pass {ev['n']} ---")
+            elif t == "pass_delta":
+                print(ev["delta"], end="", flush=True)
+            elif t == "pass_complete":
+                print(f"\n[answer: {ev['answer']!r}  confidence: {int(ev['confidence']*100)}%]")
+            elif t == "early_stop":
+                print(f"\n[early stop after {ev['passes']} passes - {ev['reason']}]")
+            elif t == "final_start":
+                print("\n\n=== FINAL ANSWER ===")
+            elif t == "final_delta":
+                print(ev["delta"], end="", flush=True)
+            elif t == "final_complete":
+                print(f"\n\nFinal: {ev['answer']!r}  confidence: {int(ev['confidence']*100)}%  "
+                      f"({ev['passes_used']} passes used)")
+    elif args.orchestrate:
+        print("\n=== ORCHESTRATE MODE ===\n")
+        for ev in eng.generate_with_orchestration(args.prompt):
+            print(ev)
+    else:
+        for tok, done, stats in eng.generate_stream(
+            prompt          = args.prompt,
+            max_new_tokens  = args.max_new_tokens,
+            temperature     = args.temperature,
+            top_k           = args.top_k,
+            top_p           = args.top_p,
+        ):
+            if tok:
+                print(tok, end="", flush=True)
+            if done:
+                print(f"\n\n[{stats.n_tokens} tokens in {stats.elapsed_s:.2f}s "
+                      f"= {stats.tok_per_sec:.1f} tok/s, status={stats.status}]")
+                break

@@ -1,22 +1,29 @@
 """
-Data preprocessing pipeline for LLM training.
+Data preprocessing pipeline for HAVOC training.
 
 Sources supported:
   - JSONL files with {"prompt": "...", "completion": "..."} records
+    (also accepts "instruction"/"input"/"output"/"response"/"text" keys)
   - Word documents (.docx)
   - Plain text files (.txt)
-  - Public-domain books auto-downloaded from Project Gutenberg (gap-filling)
+  - Public-domain books from Project Gutenberg (gap-filling)
 
-Output:
-  data/processed/train.bin         — token IDs for training records (95%)
-  data/processed/val.bin           — token IDs for validation records (5%)
-  data/processed/tokenizer_info.json
+Outputs (under --out_dir, default data/processed/):
+  train.bin               - flat token IDs for training records (95%)
+  val.bin                 - flat token IDs for validation records (5%)
+  tokenizer_info.json     - vocab/block_size/special-token IDs for dataset.py
+
+Tokenizer:
+  Uses a pre-trained HavocTokenizer (byte-level BPE) loaded from
+  --tokenizer_dir. Train it first with scripts/train_tokenizer.py.
 
 Usage:
-  python scripts/preprocess.py --data_dir data/raw
-  python scripts/preprocess.py --data_dir data/raw --gutenberg 1342 84 11  (Pride+Prejudice, Frankenstein, Alice)
-  python scripts/preprocess.py --help
+  python scripts/preprocess.py --data_dir data/raw \\
+      --tokenizer_dir models/tokenizers/havoc_bpe
+  python scripts/preprocess.py --data_dir data/raw --gutenberg 1342 84 11
 """
+
+from __future__ import annotations
 
 import argparse
 import json
@@ -29,34 +36,34 @@ import sys
 import numpy as np
 import requests
 import torch
-from transformers import GPT2TokenizerFast
 from tqdm import tqdm
 
+_HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, _HERE)
 
-# ---------------------------------------------------------------------------
-# Special tokens
-# ---------------------------------------------------------------------------
-SEP_TOKEN        = "<|sep|>"          # separates prompt from completion (legacy)
-EOT_TOKEN        = "<|endoftext|>"    # GPT-2's built-in EOS / document boundary
-THINK_TOKEN      = "<|think|>"        # opens  Chain-of-Thought reasoning block
-END_THINK_TOKEN  = "<|/think|>"       # closes Chain-of-Thought reasoning block
+from tokenizer_havoc import HavocTokenizer       # noqa: E402
 
-# ChatML / system-prompt tokens
-SYSTEM_TOKEN     = "<|system|>"       # opens  system-level instructions
-END_SYSTEM_TOKEN = "<|/system|>"      # closes system-level instructions
-USER_TOKEN       = "<|user|>"         # opens  user turn
-END_USER_TOKEN   = "<|/user|>"        # closes user turn
-ASST_TOKEN       = "<|assistant|>"    # opens  assistant turn (model generates from here)
+
+# ── Special token strings (mirror config.SPECIAL_TOKENS) ──────────────────
+EOT_TOKEN        = "<|endoftext|>"
+SEP_TOKEN        = "<|sep|>"
+THINK_TOKEN      = "<|think|>"
+END_THINK_TOKEN  = "<|/think|>"
+SYSTEM_TOKEN     = "<|system|>"
+END_SYSTEM_TOKEN = "<|/system|>"
+USER_TOKEN       = "<|user|>"
+END_USER_TOKEN   = "<|/user|>"
+ASST_TOKEN       = "<|assistant|>"
+END_ASST_TOKEN   = "<|/assistant|>"
 
 DEFAULT_SPLIT_SEED = 1337
 
 
-# ---------------------------------------------------------------------------
-# Loaders
-# ---------------------------------------------------------------------------
+# ── Loaders (unchanged from prior preprocess.py) ──────────────────────────
+
 
 def load_jsonl(path: str) -> list[str]:
-    """Load prompt/completion JSONL → formatted strings."""
+    """Load prompt/completion JSONL -> formatted strings with chat tokens."""
     records = []
     with open(path, encoding="utf-8") as f:
         for line_no, line in enumerate(f, 1):
@@ -66,43 +73,42 @@ def load_jsonl(path: str) -> list[str]:
             try:
                 obj = json.loads(line)
             except json.JSONDecodeError as e:
-                print(f"  [WARN] {path}:{line_no} JSON error: {e} — skipped")
+                print(f"  [WARN] {path}:{line_no} JSON error: {e} - skipped")
                 continue
 
-            # Accept various key names people use
-            prompt     = obj.get("prompt")     or obj.get("input")       or obj.get("instruction") or ""
-            completion = obj.get("completion") or obj.get("output")      or obj.get("response")    or obj.get("text") or ""
+            prompt     = (obj.get("prompt")     or obj.get("input")
+                          or obj.get("instruction") or "")
+            completion = (obj.get("completion") or obj.get("output")
+                          or obj.get("response") or obj.get("text") or "")
 
             if not prompt and not completion:
-                print(f"  [WARN] {path}:{line_no} no recognisable keys — skipped")
                 continue
 
             if prompt and completion:
-                # ChatML format — optionally include a per-record system field
                 system = obj.get("system", "").strip()
                 if system:
                     text = (
                         f"{EOT_TOKEN}"
                         f"{SYSTEM_TOKEN}{system}{END_SYSTEM_TOKEN}"
                         f"{USER_TOKEN}{prompt}{END_USER_TOKEN}"
-                        f"{ASST_TOKEN}{completion}{EOT_TOKEN}"
+                        f"{ASST_TOKEN}{completion}{END_ASST_TOKEN}"
+                        f"{EOT_TOKEN}"
                     )
                 else:
                     text = (
                         f"{EOT_TOKEN}"
                         f"{USER_TOKEN}{prompt}{END_USER_TOKEN}"
-                        f"{ASST_TOKEN}{completion}{EOT_TOKEN}"
+                        f"{ASST_TOKEN}{completion}{END_ASST_TOKEN}"
+                        f"{EOT_TOKEN}"
                     )
             else:
-                # completion-only record (pre-formatted text / plain document)
                 text = f"{EOT_TOKEN}{prompt or completion}{EOT_TOKEN}"
-
             records.append(text)
     return records
 
 
 def load_docx(path: str) -> list[str]:
-    """Load a Word document → one string per non-empty paragraph."""
+    """Load a Word document -> one string per non-empty paragraph group."""
     from docx import Document
     doc = Document(path)
     chunks = []
@@ -117,7 +123,6 @@ def load_docx(path: str) -> list[str]:
             current.append(text)
     if current:
         chunks.append(" ".join(current))
-    # Wrap each paragraph group as a document
     return [f"{EOT_TOKEN}{c}{EOT_TOKEN}" for c in chunks if c]
 
 
@@ -130,14 +135,11 @@ def load_txt(path: str) -> list[str]:
 
 
 def download_gutenberg(book_id: int, cache_dir: str = "data/raw/gutenberg") -> str | None:
-    """Download a Project Gutenberg book by ID. Returns local path."""
     os.makedirs(cache_dir, exist_ok=True)
     path = os.path.join(cache_dir, f"{book_id}.txt")
     if os.path.exists(path):
         print(f"  [cache] Gutenberg #{book_id} already downloaded.")
         return path
-
-    # Try common Gutenberg mirror URLs (most reliable first)
     urls = [
         f"https://www.gutenberg.org/cache/epub/{book_id}/pg{book_id}.txt",
         f"https://www.gutenberg.org/files/{book_id}/{book_id}-0.txt",
@@ -149,7 +151,7 @@ def download_gutenberg(book_id: int, cache_dir: str = "data/raw/gutenberg") -> s
             if r.status_code == 200:
                 with open(path, "wb") as f:
                     f.write(r.content)
-                print(f"  [OK] Gutenberg #{book_id} → {path}")
+                print(f"  [OK] Gutenberg #{book_id} -> {path}")
                 return path
         except Exception:
             continue
@@ -158,27 +160,22 @@ def download_gutenberg(book_id: int, cache_dir: str = "data/raw/gutenberg") -> s
 
 
 def strip_gutenberg_header_footer(text: str) -> str:
-    """Remove standard Gutenberg boilerplate."""
-    start_markers = ["*** START OF", "***START OF", "** START OF"]
-    end_markers   = ["*** END OF",   "***END OF",   "** END OF"]
+    starts = ["*** START OF", "***START OF", "** START OF"]
+    ends   = ["*** END OF",   "***END OF",   "** END OF"]
     start = 0
-    for m in start_markers:
+    for m in starts:
         idx = text.find(m)
         if idx != -1:
             start = text.find("\n", idx) + 1
             break
     end = len(text)
-    for m in end_markers:
+    for m in ends:
         idx = text.find(m)
         if idx != -1:
             end = idx
             break
     return text[start:end]
 
-
-# ---------------------------------------------------------------------------
-# Scan a directory for supported files
-# ---------------------------------------------------------------------------
 
 def load_directory(data_dir: str) -> list[str]:
     all_texts: list[str] = []
@@ -188,7 +185,6 @@ def load_directory(data_dir: str) -> list[str]:
         f for f in os.listdir(data_dir)
         if os.path.splitext(f)[1].lower() in supported
     )
-
     if not files:
         print(f"  [WARN] No supported files found in {data_dir}")
         return []
@@ -204,44 +200,35 @@ def load_directory(data_dir: str) -> list[str]:
             all_texts.extend(texts)
         except Exception as e:
             print(f"ERROR: {e}")
-
     return all_texts
 
 
-# ---------------------------------------------------------------------------
-# Tokenise + chunk
-# ---------------------------------------------------------------------------
+# ── Tokenise ──────────────────────────────────────────────────────────────
 
-def tokenize_corpus(texts: list[str], tokenizer: GPT2TokenizerFast, label: str) -> torch.Tensor:
-    """
-    Tokenise all texts in a split and return a flat LongTensor.
-    """
+
+def tokenize_corpus(texts: list[str], tokenizer: HavocTokenizer, label: str) -> torch.Tensor:
     all_ids: list[int] = []
     for text in tqdm(texts, desc=f"  {label}", unit="seg"):
-        ids = tokenizer.encode(text, add_special_tokens=False)
+        ids = tokenizer.encode(text, add_special=False)
         all_ids.extend(ids)
     return torch.tensor(all_ids, dtype=torch.long)
 
 
 def split_records(texts: list[str], val_split: float, seed: int) -> tuple[list[str], list[str]]:
-    """Split formatted records into train / validation lists using a fixed seed."""
     if not 0.0 <= val_split < 1.0:
-        raise ValueError("--val_split must be in the range [0, 1).")
+        raise ValueError("--val_split must be in [0, 1).")
     if len(texts) < 2 or val_split == 0.0:
         return texts, []
-
     val_count = min(len(texts) - 1, max(1, math.floor(len(texts) * val_split + 0.5)))
     indices = list(range(len(texts)))
     random.Random(seed).shuffle(indices)
     val_idx = set(indices[:val_count])
-
-    train_texts = [text for idx, text in enumerate(texts) if idx not in val_idx]
-    val_texts = [text for idx, text in enumerate(texts) if idx in val_idx]
-    return train_texts, val_texts
+    train = [t for i, t in enumerate(texts) if i not in val_idx]
+    val   = [t for i, t in enumerate(texts) if i in val_idx]
+    return train, val
 
 
 def token_storage_dtype(vocab_size: int) -> np.dtype:
-    """Pick a compact binary dtype that still fits the tokenizer vocabulary."""
     if vocab_size <= np.iinfo(np.uint16).max:
         return np.dtype(np.uint16)
     if vocab_size <= np.iinfo(np.uint32).max:
@@ -250,43 +237,35 @@ def token_storage_dtype(vocab_size: int) -> np.dtype:
 
 
 def save_bin(path: str, tokens: torch.Tensor, dtype: np.dtype) -> None:
-    """Persist a flat token tensor to a binary .bin file."""
     np.asarray(tokens.cpu().numpy(), dtype=dtype).tofile(path)
 
 
-# ---------------------------------------------------------------------------
-# Diagnostics
-# ---------------------------------------------------------------------------
-
-def show_samples(tokens: torch.Tensor, tokenizer: GPT2TokenizerFast, block_size: int, n: int = 3):
-    print(f"\n{'='*60}")
-    print(f"TOKENISED SAMPLE OUTPUTS  (block_size={block_size})")
-    print('='*60)
+def show_samples(tokens: torch.Tensor, tokenizer: HavocTokenizer, block_size: int, n: int = 3):
+    print(f"\n{'='*60}\n  TOKENISED SAMPLE OUTPUTS  (block_size={block_size})\n{'='*60}")
     step = max(1, len(tokens) // (n + 1))
     for i in range(n):
         start = step * (i + 1)
         chunk = tokens[start : start + block_size]
-        decoded = tokenizer.decode(chunk.tolist())
+        decoded = tokenizer.decode(chunk.tolist(), skip_special_tokens=False)
         ids_preview = chunk[:20].tolist()
-        print(f"\n--- Sample {i+1} (tokens {start}–{start+block_size}) ---")
+        print(f"\n--- Sample {i+1} (tokens {start}-{start+block_size}) ---")
         print(f"IDs (first 20):  {ids_preview}")
         print(f"Decoded text:\n{decoded[:300]}")
     print('='*60)
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
+# ── Main ──────────────────────────────────────────────────────────────────
+
 
 def main():
-    parser = argparse.ArgumentParser(description="Preprocess text data for LLM training")
-    parser.add_argument("--data_dir",   default="data/raw",         help="Directory with .jsonl/.docx/.txt files")
-    parser.add_argument("--out_dir",    default="data/processed",   help="Output directory")
-    parser.add_argument("--block_size", type=int, default=2048,      help="Token sequence length per training example")
-    parser.add_argument("--val_split",  type=float, default=0.05,    help="Fraction of records held out for validation")
-    parser.add_argument("--gutenberg",  nargs="*", type=int,
-                        metavar="BOOK_ID",
-                        help="Project Gutenberg book IDs to download for gap-filling, e.g. --gutenberg 1342 84")
+    parser = argparse.ArgumentParser(description="Preprocess text data for HAVOC.")
+    parser.add_argument("--data_dir",      default="data/raw")
+    parser.add_argument("--out_dir",       default="data/processed")
+    parser.add_argument("--tokenizer_dir", default="models/tokenizers/havoc_bpe",
+                        help="Path to a trained HavocTokenizer.")
+    parser.add_argument("--block_size",    type=int, default=2048)
+    parser.add_argument("--val_split",     type=float, default=0.05)
+    parser.add_argument("--gutenberg",     nargs="*", type=int, metavar="BOOK_ID")
     args = parser.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
@@ -294,7 +273,6 @@ def main():
     print("\n=== 1. Loading data ===")
     texts = load_directory(args.data_dir)
 
-    # Optional public-domain gap-filler books
     if args.gutenberg:
         print("\n  Fetching Project Gutenberg books ...")
         for book_id in args.gutenberg:
@@ -310,29 +288,26 @@ def main():
                 )
 
     if not texts:
-        print("\nNo data loaded. Put .jsonl / .docx / .txt files in", args.data_dir)
+        print(f"\nNo data loaded. Put .jsonl/.docx/.txt in {args.data_dir}")
         sys.exit(1)
-
     print(f"\n  Total segments: {len(texts):,}")
 
-    print("\n=== 2. Train / validation split (record-level, reproducible) ===")
+    print("\n=== 2. Train/val split (record-level, reproducible) ===")
     train_texts, val_texts = split_records(texts, args.val_split, DEFAULT_SPLIT_SEED)
     print(f"  Split seed:    {DEFAULT_SPLIT_SEED}")
     print(f"  Train records: {len(train_texts):,}")
     print(f"  Val records:   {len(val_texts):,}")
 
-    print("\n=== 3. Loading GPT-2 tokenizer ===")
-    tokenizer = GPT2TokenizerFast.from_pretrained("gpt2")
-    tokenizer.add_special_tokens({
-        "additional_special_tokens": [
-            SEP_TOKEN, THINK_TOKEN, END_THINK_TOKEN,
-            SYSTEM_TOKEN, END_SYSTEM_TOKEN, USER_TOKEN, END_USER_TOKEN, ASST_TOKEN,
-        ]
-    })
-    # GPT-2's built-in EOS is already <|endoftext|>; map pad → EOS
-    tokenizer.pad_token = tokenizer.eos_token
-    print(f"  Vocab size: {len(tokenizer):,}  "
-          f"(GPT-2 base: 50257, +8 special tokens)")
+    print("\n=== 3. Loading HavocTokenizer ===")
+    if not os.path.isfile(os.path.join(args.tokenizer_dir, "tokenizer.json")):
+        print(f"\nERROR: no trained tokenizer found at {args.tokenizer_dir}\n"
+              f"Run: python scripts/train_tokenizer.py --corpus {args.data_dir} "
+              f"--vocab_size 16384 --out {args.tokenizer_dir}")
+        sys.exit(1)
+    tokenizer = HavocTokenizer.from_pretrained(args.tokenizer_dir)
+    print(f"  Vocab size: {tokenizer.vocab_size:,}")
+    print(f"  Specials  : eos={tokenizer.eos_token_id}  pad={tokenizer.pad_token_id}  "
+          f"think={tokenizer.think_token_id}  /think={tokenizer.end_think_token_id}")
 
     print("\n=== 4. Tokenising ===")
     train_t = tokenize_corpus(train_texts, tokenizer, label="Tokenising train")
@@ -340,16 +315,11 @@ def main():
     print(f"  Train tokens: {len(train_t):,}  ({len(train_t)//args.block_size:,} full blocks)")
     print(f"  Val tokens:   {len(val_t):,}  ({len(val_t)//args.block_size:,} full blocks)")
 
-    min_needed = args.block_size * 10
-    if len(train_t) < min_needed:
-        print(f"\n  [WARN] Only {len(train_t):,} training tokens — need at least {min_needed:,} for meaningful training.")
-        print(  "         Add more data or use --gutenberg to pull in public-domain books.")
-    if len(train_t) < 5_000_000:
-        print(f"\n  [WARN] Training split has only {len(train_t):,} tokens.")
-        print(  "         That's under the recommended 5,000,000 training-token floor.")
+    if len(train_t) < args.block_size * 10:
+        print(f"\n  [WARN] Only {len(train_t):,} training tokens.")
 
     print("\n=== 5. Saving ===")
-    token_dtype = token_storage_dtype(len(tokenizer))
+    token_dtype = token_storage_dtype(tokenizer.vocab_size)
     train_path = os.path.join(args.out_dir, "train.bin")
     val_path   = os.path.join(args.out_dir, "val.bin")
     save_bin(train_path, train_t, token_dtype)
@@ -358,37 +328,30 @@ def main():
     print(f"  {val_path}")
 
     info = {
-        "vocab_size":           len(tokenizer),
-        "block_size":           args.block_size,
-        "train_tokens":         len(train_t),
-        "val_tokens":           len(val_t),
-        "train_records":        len(train_texts),
-        "val_records":          len(val_texts),
-        "val_split":            args.val_split,
-        "split_seed":           DEFAULT_SPLIT_SEED,
-        "train_file":           os.path.basename(train_path),
-        "val_file":             os.path.basename(val_path),
-        "token_dtype":          token_dtype.name,
-        # Token strings
-        "sep_token":            SEP_TOKEN,
-        "eot_token":            EOT_TOKEN,
-        "think_token":          THINK_TOKEN,
-        "end_think_token":      END_THINK_TOKEN,
-        "system_token":         SYSTEM_TOKEN,
-        "end_system_token":     END_SYSTEM_TOKEN,
-        "user_token":           USER_TOKEN,
-        "end_user_token":       END_USER_TOKEN,
-        "asst_token":           ASST_TOKEN,
-        # Token IDs
-        "sep_token_id":         tokenizer.convert_tokens_to_ids(SEP_TOKEN),
-        "eot_token_id":         tokenizer.eos_token_id,
-        "think_token_id":       tokenizer.convert_tokens_to_ids(THINK_TOKEN),
-        "end_think_token_id":   tokenizer.convert_tokens_to_ids(END_THINK_TOKEN),
-        "system_token_id":      tokenizer.convert_tokens_to_ids(SYSTEM_TOKEN),
-        "end_system_token_id":  tokenizer.convert_tokens_to_ids(END_SYSTEM_TOKEN),
-        "user_token_id":        tokenizer.convert_tokens_to_ids(USER_TOKEN),
-        "end_user_token_id":    tokenizer.convert_tokens_to_ids(END_USER_TOKEN),
-        "asst_token_id":        tokenizer.convert_tokens_to_ids(ASST_TOKEN),
+        "vocab_size":          tokenizer.vocab_size,
+        "block_size":          args.block_size,
+        "train_tokens":        len(train_t),
+        "val_tokens":          len(val_t),
+        "train_records":       len(train_texts),
+        "val_records":         len(val_texts),
+        "val_split":           args.val_split,
+        "split_seed":          DEFAULT_SPLIT_SEED,
+        "train_file":          os.path.basename(train_path),
+        "val_file":            os.path.basename(val_path),
+        "token_dtype":         token_dtype.name,
+        "tokenizer_dir":       os.path.abspath(args.tokenizer_dir),
+        # Keep field names compatible with dataset.py expectations
+        "eot_token_id":        tokenizer.eos_token_id,
+        "sep_token_id":        tokenizer.sep_token_id,
+        "pad_token_id":        tokenizer.pad_token_id,
+        "think_token_id":      tokenizer.think_token_id,
+        "end_think_token_id":  tokenizer.end_think_token_id,
+        "system_token_id":     tokenizer.system_token_id,
+        "end_system_token_id": tokenizer.end_system_token_id,
+        "user_token_id":       tokenizer.user_token_id,
+        "end_user_token_id":   tokenizer.end_user_token_id,
+        "asst_token_id":       tokenizer.assistant_token_id,
+        "end_asst_token_id":   tokenizer.end_assistant_token_id,
     }
     info_path = os.path.join(args.out_dir, "tokenizer_info.json")
     with open(info_path, "w") as f:
@@ -396,20 +359,17 @@ def main():
     print(f"  {info_path}")
 
     print("\n=== 6. Sample verification ===")
-    sample_tokens = train_t if len(train_t) else val_t
-    show_samples(sample_tokens, tokenizer, args.block_size)
+    sample = train_t if len(train_t) else val_t
+    show_samples(sample, tokenizer, args.block_size)
 
     print("\n=== Done ===")
-    print(f"  vocab_size             : {len(tokenizer)}")
-    print(f"  total training tokens  : {len(train_t):,}")
-    print(f"  total validation tokens: {len(val_t):,}")
-    print(f"  think_token_id         : {info['think_token_id']}  (<|think|>)")
-    print(f"  end_think_token_id     : {info['end_think_token_id']}  (<|/think|>)")
-    print(f"  system_token_id        : {info['system_token_id']}  (<|system|>)")
-    print(f"  user_token_id          : {info['user_token_id']}  (<|user|>)")
-    print(f"  asst_token_id          : {info['asst_token_id']}  (<|assistant|>)")
-    print(f"  Chain-of-Thought ready : yes — use model.generate_cot() at inference")
-    print(f"  System-prompt ready    : yes — set via InferenceEngine.set_system_prompt()\n")
+    print(f"  vocab_size       : {tokenizer.vocab_size}")
+    print(f"  train tokens     : {len(train_t):,}")
+    print(f"  val tokens       : {len(val_t):,}")
+    print(f"  think_token_id   : {tokenizer.think_token_id}  ({THINK_TOKEN})")
+    print(f"  user_token_id    : {tokenizer.user_token_id}  ({USER_TOKEN})")
+    print(f"  asst_token_id    : {tokenizer.assistant_token_id}  ({ASST_TOKEN})")
+    print()
 
 
 if __name__ == "__main__":

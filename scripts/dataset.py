@@ -2,7 +2,7 @@
 LM dataset and DataLoader factory.
 
 Loads preprocessed token tensors from data/processed/ and wraps them
-in PyTorch Dataset / DataLoader objects ready for train.py.
+in PyTorch Dataset / DataLoader objects ready for pretrain.py / sft.py.
 
 Can also be run standalone to inspect batches:
     python scripts/dataset.py
@@ -10,6 +10,7 @@ Can also be run standalone to inspect batches:
 
 import json
 import os
+import sys
 
 import numpy as np
 import torch
@@ -165,11 +166,12 @@ if __name__ == "__main__":
     print(f"  Train batches  : {len(train_loader):,}  (batch_size=4)")
     print(f"  Val   batches  : {len(val_loader):,}")
 
-    # Load tokenizer to decode
+    # Load tokenizer to decode (HavocTokenizer)
     try:
-        from transformers import GPT2TokenizerFast
-        tokenizer = GPT2TokenizerFast.from_pretrained("gpt2")
-        tokenizer.add_special_tokens({"additional_special_tokens": ["<|sep|>"]})
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from tokenizer_havoc import HavocTokenizer
+        tok_dir = info.get("tokenizer_dir", "models/tokenizers/havoc_bpe")
+        tokenizer = HavocTokenizer.from_pretrained(tok_dir)
         can_decode = True
     except Exception:
         can_decode = False
