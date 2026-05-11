@@ -1,16 +1,19 @@
 """
 HAVOC v0 pretraining dataset assembler.
 
-Walks a local staging directory + pulls Cosmopedia-100k from HuggingFace,
-classifies each source into one of four buckets, trains a HavocTokenizer
+Walks a local staging directory, optionally streams external corpora from
+HuggingFace, classifies every source into a bucket, trains a HavocTokenizer
 on the combined corpus, then writes train.bin / val.bin sized to a
 configurable target with the requested per-bucket sampling proportions.
 
 Default buckets and mix:
-    cosmopedia      50%   (HuggingFaceTB/cosmopedia-100k, split=train)
-    academic        25%   (Academic Corpus/_cleaned/corpus.jsonl)
-    conversational  15%   (Prompt Completion Pairs/D_Conversations*.jsonl)
-    stem            10%   (Prompt Completion Pairs/D_*.jsonl, excluding Conversations)
+    academic        15%   (Academic Corpus/_cleaned/corpus.jsonl)
+    conversational  10%   (Prompt Completion Pairs/D_Conversations*.jsonl)
+    stem             5%   (Prompt Completion Pairs/D_*.jsonl, excluding Conversations)
+    fineweb_edu     35%   (chengjunyan1/smollm-12.5-corpus, fineweb-edu-dedup)
+    cosmopedia_v2   20%   (chengjunyan1/smollm-12.5-corpus, cosmopedia-v2)
+    tinystories     10%   (roneneldan/TinyStories)
+    oasst2           5%   (local 2023-11-05_oasst2_ready.trees.jsonl.gz, en + quality>=0.5)
 
 Skipped automatically:
     python.jsonl, bash_shell.jsonl, git_commands.jsonl  (unfinished)
@@ -22,23 +25,24 @@ Each D_*.jsonl row is converted to plain chat text:
 
 The original D_*.jsonl files are NEVER modified.
 
-Usage (default paths):
-    python scripts/build_v0_dataset.py
-
-Override paths:
+Usage on RunPod (default paths assume /workspace):
     python scripts/build_v0_dataset.py \\
-        --staging_dir "C:\\Users\\Scott\\OneDrive\\Desktop\\HAVOC train data" \\
-        --out_dir data/processed_v0 \\
-        --tokenizer_dir models/tokenizers/havoc_v0 \\
-        --total_tokens 40_000_000
+        --staging_dir /workspace/havoc_train_data \\
+        --out_dir /workspace/data/processed_v0 \\
+        --tokenizer_dir /workspace/models/tokenizers/havoc_v0 \\
+        --oasst2_path /workspace/data/raw/2023-11-05_oasst2_ready.trees.jsonl.gz \\
+        --total_tokens 200_000_000
 
-Faster smoke test (limits cosmopedia, smaller target):
-    python scripts/build_v0_dataset.py --max_cosmopedia 5000 --total_tokens 5_000_000
+Smoke test (cap HF rows, smaller target):
+    python scripts/build_v0_dataset.py \\
+        --max_fineweb_edu 5000 --max_cosmopedia_v2 5000 --max_tinystories 5000 \\
+        --total_tokens 5_000_000
 """
 
 from __future__ import annotations
 
 import argparse
+import gzip
 import json
 import math
 import os
@@ -150,18 +154,84 @@ def read_d_pairs(path: str) -> Iterable[str]:
                 yield f"User: {p}\n\nAssistant: {c}"
 
 
-def read_cosmopedia(max_samples: int | None = None) -> Iterable[str]:
-    """Stream Cosmopedia-100k from HF, yielding the 'text' field per row."""
+def read_hf_text(dataset_name: str,
+                 config: str | None = None,
+                 split: str = "train",
+                 max_samples: int | None = None,
+                 text_keys: tuple[str, ...] = ("text", "content", "completion")) -> Iterable[str]:
+    """Stream a HuggingFace text dataset, yielding non-empty strings."""
     from datasets import load_dataset
-    ds = load_dataset("HuggingFaceTB/cosmopedia-100k", split="train")
+    ds = load_dataset(dataset_name, config, split=split) if config else \
+         load_dataset(dataset_name, split=split)
     n = 0
     for row in ds:
-        t = row.get("text") or row.get("completion") or ""
-        if isinstance(t, str) and t.strip():
+        t = ""
+        for k in text_keys:
+            v = row.get(k)
+            if isinstance(v, str) and v.strip():
+                t = v
+                break
+        if t:
             yield t
             n += 1
             if max_samples and n >= max_samples:
                 return
+
+
+def read_oasst2_trees(path: str,
+                      min_quality: float = 0.5,
+                      lang: str = "en") -> Iterable[str]:
+    """
+    Stream OASST2 conversation trees from a .jsonl.gz file.
+
+    Each tree row contains a `prompt` node with nested `replies`. We walk
+    every root->leaf path of (prompter, assistant, prompter, ...) turns,
+    filtering on language and a labels.quality value when present, and emit
+    a single chat-style record per path.
+    """
+    def _quality(node: dict) -> float:
+        labels = (node.get("labels") or {})
+        q = labels.get("quality")
+        if isinstance(q, dict):
+            return float(q.get("value", 0.0))
+        if isinstance(q, (int, float)):
+            return float(q)
+        return 1.0  # no label = accept
+
+    def _walk(node: dict, history: list[tuple[str, str]]) -> Iterable[list[tuple[str, str]]]:
+        if node.get("lang", lang) != lang:
+            return
+        if _quality(node) < min_quality:
+            return
+        role = node.get("role", "")
+        text = (node.get("text") or "").strip()
+        if not text:
+            return
+        new_hist = history + [(role, text)]
+        replies = node.get("replies") or []
+        if not replies:
+            yield new_hist
+            return
+        for r in replies:
+            yield from _walk(r, new_hist)
+
+    opener = gzip.open if path.endswith(".gz") else open
+    with opener(path, "rt", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                tree = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            root = tree.get("prompt") or tree
+            for turns in _walk(root, []):
+                parts = []
+                for role, text in turns:
+                    speaker = "User" if role == "prompter" else "Assistant"
+                    parts.append(f"{speaker}: {text}")
+                yield "\n\n".join(parts)
 
 
 # ── tokenizer training (small subset of each bucket) ─────────────────────
@@ -190,14 +260,31 @@ def main() -> int:
     p.add_argument("--block_size",   type=int, default=2048)
     p.add_argument("--total_tokens", type=int, default=40_000_000,
                    help="Target total token count after upsampling/truncation.")
-    p.add_argument("--mix_cosmopedia",     type=float, default=0.50)
-    p.add_argument("--mix_academic",       type=float, default=0.25)
-    p.add_argument("--mix_conversational", type=float, default=0.15)
-    p.add_argument("--mix_stem",           type=float, default=0.10)
+    # Local-source mix
+    p.add_argument("--mix_academic",       type=float, default=0.15)
+    p.add_argument("--mix_conversational", type=float, default=0.10)
+    p.add_argument("--mix_stem",           type=float, default=0.05)
+    # HuggingFace-source mix
+    p.add_argument("--mix_fineweb_edu",    type=float, default=0.35,
+                   help="Share for chengjunyan1/smollm-12.5-corpus (fineweb-edu-dedup).")
+    p.add_argument("--mix_cosmopedia_v2",  type=float, default=0.20,
+                   help="Share for chengjunyan1/smollm-12.5-corpus (cosmopedia-v2).")
+    p.add_argument("--mix_tinystories",    type=float, default=0.10,
+                   help="Share for roneneldan/TinyStories.")
+    p.add_argument("--mix_oasst2",         type=float, default=0.05,
+                   help="Share for OASST2 conversations (local .jsonl.gz).")
+    # HuggingFace source caps (None = stream full split)
+    p.add_argument("--max_fineweb_edu",    type=int, default=None)
+    p.add_argument("--max_cosmopedia_v2",  type=int, default=None)
+    p.add_argument("--max_tinystories",    type=int, default=None)
+    # OASST2 inputs
+    p.add_argument("--oasst2_path",        default=None,
+                   help="Path to 2023-11-05_oasst2_ready.trees.jsonl.gz "
+                        "(skips OASST2 bucket if omitted or missing).")
+    p.add_argument("--oasst2_min_quality", type=float, default=0.5)
+    p.add_argument("--oasst2_lang",        default="en")
     p.add_argument("--val_split",          type=float, default=0.02)
     p.add_argument("--seed",               type=int,   default=1337)
-    p.add_argument("--max_cosmopedia",     type=int,   default=None,
-                   help="Cap cosmopedia rows (faster smoke runs).")
     p.add_argument("--no_train_tokenizer", action="store_true",
                    help="Reuse existing tokenizer at --tokenizer_dir.")
     p.add_argument("--tok_train_samples_per_bucket", type=int, default=4000,
@@ -219,8 +306,9 @@ def main() -> int:
 
     # ── 2. Load text records per bucket ──────────────────────────────────
     print("\n=== 2. Loading text records ===")
-    records: dict[str, list[str]] = {b: [] for b in
-                                     ("cosmopedia", "academic", "conversational", "stem")}
+    bucket_names = ("academic", "conversational", "stem",
+                    "fineweb_edu", "cosmopedia_v2", "tinystories", "oasst2")
+    records: dict[str, list[str]] = {b: [] for b in bucket_names}
 
     for path in bucketed["academic"]:
         records["academic"].extend(read_academic(path))
@@ -233,16 +321,57 @@ def main() -> int:
     print(f"  conversational : {len(records['conversational']):,} records")
     print(f"  stem           : {len(records['stem']):,} records")
 
-    print("\n  Streaming Cosmopedia-100k from HuggingFace ...")
-    n_cosmo = 0
-    for t in tqdm(read_cosmopedia(args.max_cosmopedia), desc="  cosmopedia", unit="rec"):
-        records["cosmopedia"].append(t)
-        n_cosmo += 1
-    print(f"  cosmopedia     : {len(records['cosmopedia']):,} records")
+    # HuggingFace: chengjunyan1/smollm-12.5-corpus (fineweb-edu-dedup)
+    if args.mix_fineweb_edu > 0:
+        print("\n  Streaming smollm-12.5-corpus / fineweb-edu-dedup from HuggingFace ...")
+        for t in tqdm(
+            read_hf_text("chengjunyan1/smollm-12.5-corpus",
+                         config="fineweb-edu-dedup",
+                         split="train",
+                         max_samples=args.max_fineweb_edu),
+            desc="  fineweb-edu", unit="rec",
+        ):
+            records["fineweb_edu"].append(t)
+        print(f"  fineweb_edu    : {len(records['fineweb_edu']):,} records")
 
-    if not records["cosmopedia"]:
-        print("ERROR: failed to load any cosmopedia records.", file=sys.stderr)
-        return 1
+    # HuggingFace: chengjunyan1/smollm-12.5-corpus (cosmopedia-v2)
+    if args.mix_cosmopedia_v2 > 0:
+        print("\n  Streaming smollm-12.5-corpus / cosmopedia-v2 from HuggingFace ...")
+        for t in tqdm(
+            read_hf_text("chengjunyan1/smollm-12.5-corpus",
+                         config="cosmopedia-v2",
+                         split="train",
+                         max_samples=args.max_cosmopedia_v2),
+            desc="  cosmopedia-v2", unit="rec",
+        ):
+            records["cosmopedia_v2"].append(t)
+        print(f"  cosmopedia_v2  : {len(records['cosmopedia_v2']):,} records")
+
+    # HuggingFace: roneneldan/TinyStories
+    if args.mix_tinystories > 0:
+        print("\n  Streaming TinyStories from HuggingFace ...")
+        for t in tqdm(
+            read_hf_text("roneneldan/TinyStories",
+                         split="train",
+                         max_samples=args.max_tinystories),
+            desc="  tinystories", unit="rec",
+        ):
+            records["tinystories"].append(t)
+        print(f"  tinystories    : {len(records['tinystories']):,} records")
+
+    # Local OASST2 conversation trees (.jsonl.gz)
+    if args.mix_oasst2 > 0 and args.oasst2_path and os.path.isfile(args.oasst2_path):
+        print(f"\n  Loading OASST2 trees from {args.oasst2_path} ...")
+        for t in tqdm(
+            read_oasst2_trees(args.oasst2_path,
+                              min_quality=args.oasst2_min_quality,
+                              lang=args.oasst2_lang),
+            desc="  oasst2", unit="conv",
+        ):
+            records["oasst2"].append(t)
+        print(f"  oasst2         : {len(records['oasst2']):,} records")
+    elif args.mix_oasst2 > 0:
+        print(f"\n  [WARN] OASST2 requested but --oasst2_path not provided / not found - skipping")
 
     # ── 3. Tokenizer ─────────────────────────────────────────────────────
     print("\n=== 3. Tokenizer ===")
@@ -278,11 +407,21 @@ def main() -> int:
     # ── 5. Build mix ─────────────────────────────────────────────────────
     print("\n=== 5. Building sampling mix ===")
     mix = {
-        "cosmopedia":     args.mix_cosmopedia,
         "academic":       args.mix_academic,
         "conversational": args.mix_conversational,
         "stem":           args.mix_stem,
+        "fineweb_edu":    args.mix_fineweb_edu,
+        "cosmopedia_v2":  args.mix_cosmopedia_v2,
+        "tinystories":    args.mix_tinystories,
+        "oasst2":         args.mix_oasst2,
     }
+    # Drop any bucket that has no data — rescale the rest so we don't allocate
+    # tokens to an empty source.
+    for k in list(mix.keys()):
+        if not records.get(k):
+            if mix[k] > 0:
+                print(f"  [INFO] no records for '{k}' - dropping from mix")
+            mix[k] = 0.0
     s = sum(mix.values())
     if abs(s - 1.0) > 1e-6:
         print(f"  [WARN] proportions sum to {s:.4f}, not 1.0 - rescaling")
@@ -386,7 +525,15 @@ def main() -> int:
         rel = os.path.relpath(path, args.staging_dir)
         print(f"    - {rel} -> {reason}")
 
-    print(f"\n  Cosmopedia: HuggingFaceTB/cosmopedia-100k  ({len(records['cosmopedia']):,} rows)")
+    print(f"\n  External sources:")
+    print(f"    fineweb-edu-dedup  : {len(records['fineweb_edu']):,} rows  "
+          f"(chengjunyan1/smollm-12.5-corpus)")
+    print(f"    cosmopedia-v2      : {len(records['cosmopedia_v2']):,} rows  "
+          f"(chengjunyan1/smollm-12.5-corpus)")
+    print(f"    tinystories        : {len(records['tinystories']):,} rows  "
+          f"(roneneldan/TinyStories)")
+    print(f"    oasst2 (local .gz) : {len(records['oasst2']):,} conversations"
+          + (f"  ({args.oasst2_path})" if args.oasst2_path else "  (path not set)"))
     print(f"\n  Bucket classification (corpus vs D_ completions):")
     for path in bucketed["academic"]:
         print(f"    [academic corpus]  {os.path.relpath(path, args.staging_dir)}")

@@ -3,7 +3,10 @@
     "allow": [
       "Bash(nvidia-smi)",
       "Bash(source venv/Scripts/activate)",
-      "Bash(python -m pip install --upgrade pip)"
+      "Bash(python -m pip install --upgrade pip)",
+      "Read(//c/Users/stusc/OneDrive/Desktop/HAVOC train data/Academic Corpus/_cleaned/**)",
+      "Read(//c/Users/stusc/OneDrive/Desktop/HAVOC train data/Prompt Completion Pairs/**)",
+      "Bash(python -c ' *)"
     ]
   }
 }

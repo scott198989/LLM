@@ -1,0 +1,48 @@
+venv/
+__pycache__/
+*.pyc
+*.pth
+*.pt
+*.bin
+*.safetensors
+
+# Training artifacts (regeneratable; large)
+data/raw/*
+data/processed/*
+data/processed_v0/
+data/processed_v0/*
+data/processed_tiny_v0/
+data/processed_tiny_v0/*
+data/processed_smoke/
+data/processed_smoke_run/
+data/smoke_raw/
+data/sft/
+data/knowledge/
+
+# Trained weights and tokenizers (regeneratable; large)
+logs/*
+models/checkpoints/
+models/checkpoints/*
+models/tokenizers/
+models/tokenizers/*
+
+# Keep directory placeholders for required dirs
+!data/raw/.gitkeep
+!data/sft/.gitkeep
+!data/knowledge/.gitkeep
+!models/checkpoints/.gitkeep
+!models/tokenizers/.gitkeep
+
+# Environment / build / IDE
+.env
+*.egg-info/
+dist/
+build/
+.ipynb_checkpoints/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# HF cache (if it ends up in-repo)
+.cache/

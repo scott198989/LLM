@@ -152,7 +152,7 @@ class InferenceEngine:
 
         # Load tokenizer
         # 1) explicit arg, 2) checkpoint metadata, 3) default location
-        tok_dir = tokenizer_dir or ck.get("tokenizer_dir") or "models/tokenizers/havoc_bpe"
+        tok_dir = tokenizer_dir or ck.get("tokenizer_dir") or "models/tokenizers/havoc_v0"
         tokenizer = None
         if os.path.isfile(os.path.join(tok_dir, "tokenizer.json")):
             tokenizer = HavocTokenizer.from_pretrained(tok_dir)

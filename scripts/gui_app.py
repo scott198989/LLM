@@ -328,8 +328,8 @@ class SidebarPanel(ctk.CTkScrollableFrame):
     def set_model_info(self, info: dict) -> None:
         n = info.get("n_params", 0)
         text = (
-            f"  {info.get('n_layer')}L · {info.get('n_embd')}D · {info.get('n_head')}H\n"
-            f"  {n/1e6:.1f}M params · block {info.get('block_size')}\n"
+            f"  {info.get('num_layers')}L · {info.get('hidden_size')}D · {info.get('num_heads')}H\n"
+            f"  {n/1e6:.1f}M params · block {info.get('max_seq_len')}\n"
             f"  epoch {info.get('epoch')} · step {info.get('step')}\n"
             f"  val loss {info.get('val_loss', 0):.4f} · {info.get('device', '').upper()}"
         )
@@ -907,8 +907,8 @@ class GPTInferenceApp(ctk.CTk):
         self._main.enable_generate()
         self._main.append_system(
             f"Loaded {info['n_params']/1e6:.1f}M-param model on {info['device'].upper()}\n"
-            f"Layers {info['n_layer']} · Hidden {info['n_embd']} · Heads {info['n_head']}\n"
-            f"Context {info['block_size']} tokens · Val loss {info.get('val_loss',0):.4f}\n"
+            f"Layers {info['num_layers']} · Hidden {info['hidden_size']} · Heads {info['num_heads']}\n"
+            f"Context {info['max_seq_len']} tokens · Val loss {info.get('val_loss',0):.4f}\n"
             "─" * 50 + "\n"
         )
         self._save_settings()
@@ -949,7 +949,7 @@ class GPTInferenceApp(ctk.CTk):
             "top_p":              self._sidebar.top_p,
             "repetition_penalty": self._sidebar.rep_penalty,
             "sampling_mode":      self._sidebar.sampling_mode,
-            "use_cot":            self._sidebar.use_cot,
+            "cot":                self._sidebar.use_cot,
             "stop_event":         self._stop_ev,
         }
 
