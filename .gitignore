@@ -1,12 +1,28 @@
+# ── Python ────────────────────────────────────────────────────────────────
 venv/
+.venv/
 __pycache__/
 *.pyc
-*.pth
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# ── Model artifacts (regeneratable, large) ───────────────────────────────
 *.pt
+*.pth
 *.bin
 *.safetensors
+checkpoints/
+checkpoints/*
+models/checkpoints/
+models/checkpoints/*
+models/tokenizers/
+models/tokenizers/*
 
-# Training artifacts (regeneratable; large)
+# ── Pretrain shards / processed data ─────────────────────────────────────
+data/shards/
+data/shards/*
 data/raw/*
 data/processed/*
 data/processed_v0/
@@ -17,32 +33,41 @@ data/processed_smoke/
 data/processed_smoke_run/
 data/smoke_raw/
 data/sft/
+data/sft_v0/
 data/knowledge/
+data/train_log.csv
 
-# Trained weights and tokenizers (regeneratable; large)
-logs/*
-models/checkpoints/
-models/checkpoints/*
-models/tokenizers/
-models/tokenizers/*
-
-# Keep directory placeholders for required dirs
+# Keep directory placeholders (commit empty .gitkeep markers)
 !data/raw/.gitkeep
 !data/sft/.gitkeep
 !data/knowledge/.gitkeep
+!data/shards/.gitkeep
+!checkpoints/.gitkeep
 !models/checkpoints/.gitkeep
 !models/tokenizers/.gitkeep
 
-# Environment / build / IDE
-.env
-*.egg-info/
-dist/
-build/
+# ── Logs / runs ───────────────────────────────────────────────────────────
+logs/*
+runs/
+tensorboard/
+wandb/
+*.log
+
+# ── Notebook checkpoints ──────────────────────────────────────────────────
 .ipynb_checkpoints/
+
+# ── HuggingFace cache ─────────────────────────────────────────────────────
+.cache/
+.huggingface/
+
+# ── Env / secrets ─────────────────────────────────────────────────────────
+.env
+.env.*
+*.key
+*.pem
+
+# ── IDE / OS ──────────────────────────────────────────────────────────────
 .vscode/
 .idea/
 .DS_Store
 Thumbs.db
-
-# HF cache (if it ends up in-repo)
-.cache/

@@ -1,0 +1,24 @@
+{
+  "vocab_size": 50257,
+  "eot_id": 50256,
+  "dtype": "uint16",
+  "tokens_per_shard": 1000000,
+  "train_shards": [
+    "train_00000.bin",
+    "train_00001.bin",
+    "train_00002.bin",
+    "train_00003.bin"
+  ],
+  "val_shards": [
+    "val_00000.bin"
+  ],
+  "train_tokens": 3401070,
+  "val_tokens": 100000,
+  "per_source_tokens": {
+    "fineweb_edu": 2000110,
+    "cosmopedia_v2": 500653,
+    "tinystories": 500220,
+    "oasst2": 500087
+  },
+  "seed": 1337
+}

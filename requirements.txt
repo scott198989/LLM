@@ -6,6 +6,8 @@
 
 # ── Core training ──────────────────────────────────────────────────────────
 tokenizers>=0.19.0
+tiktoken>=0.7.0               # GPT-2 BPE for shoes-model pretrain
+pyarrow>=15.0.0               # Parquet readers for fineweb/cosmopedia/tinystories
 numpy>=1.26.0
 tqdm>=4.66.0
 accelerate>=0.30.0
