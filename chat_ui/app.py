@@ -41,9 +41,14 @@ _PROJ     = os.path.dirname(_HERE)
 _SCRIPTS  = os.path.join(_PROJ, "scripts")
 sys.path.insert(0, _SCRIPTS)
 
-from inference   import InferenceEngine               # noqa: E402
-from refinement  import RefinementEngine              # noqa: E402
-from orchestrator import Orchestrator                  # noqa: E402
+from inference     import InferenceEngine             # noqa: E402
+from refinement    import RefinementEngine            # noqa: E402
+from orchestrator  import Orchestrator                # noqa: E402
+
+# nanoGPT-style HAVOC (model/havoc.py + GPT-2 BPE) — separate loader
+sys.path.insert(0, _PROJ)
+from chat_ui.nanogpt_engine   import NanoGPTEngine, looks_like_nanogpt_ckpt  # noqa: E402
+from chat_ui.reasoning_engine import ReasoningEngine                         # noqa: E402
 
 app = FastAPI(title="HAVOC Chat")
 
@@ -54,17 +59,33 @@ app = FastAPI(title="HAVOC Chat")
 CKPT_PATH = os.environ.get("HAVOC_CKPT") or os.path.join(_PROJ, "models", "checkpoints", "best.pt")
 TOK_PATH  = os.environ.get("HAVOC_TOK")  or os.path.join(_PROJ, "models", "tokenizers", "havoc_bpe")
 
-engine: InferenceEngine = InferenceEngine()
+engine = None                       # populated below; either InferenceEngine or NanoGPTEngine
+arch: str = "unknown"               # "havoc" | "nanogpt"
 load_error: Optional[str] = None
 
 if os.path.isfile(CKPT_PATH):
     try:
-        meta = engine.load_model(CKPT_PATH, tokenizer_dir=TOK_PATH)
-        print(f"Loaded HAVOC: {meta['n_params']:,} params from {CKPT_PATH}")
+        # Peek at the checkpoint to pick the matching model class
+        _ck_peek = torch.load(CKPT_PATH, map_location="cpu", weights_only=False)
+        if looks_like_nanogpt_ckpt(_ck_peek):
+            arch = "nanogpt"
+            engine = NanoGPTEngine()
+            meta = engine.load_model(CKPT_PATH)
+            print(f"Loaded HAVOC (nanoGPT): {meta['n_params']:,} params from {CKPT_PATH}")
+        else:
+            arch = "havoc"
+            engine = InferenceEngine()
+            meta = engine.load_model(CKPT_PATH, tokenizer_dir=TOK_PATH)
+            print(f"Loaded HAVOC: {meta['n_params']:,} params from {CKPT_PATH}")
+        del _ck_peek
     except Exception as exc:
         load_error = f"{type(exc).__name__}: {exc}"
         print(f"  WARN: failed to load {CKPT_PATH}: {load_error}")
+        # Fall back to an empty modern engine so /status etc. still respond
+        if engine is None:
+            engine = InferenceEngine()
 else:
+    engine = InferenceEngine()
     load_error = f"checkpoint not found at {CKPT_PATH} - train HAVOC first"
     print(f"  WARN: {load_error}")
 
@@ -150,6 +171,14 @@ def _ensure_loaded():
     return None
 
 
+def _ensure_havoc_arch():
+    if arch != "havoc":
+        return _sse({"type": "error",
+                     "content": "refinement/orchestration require a HAVOC SFT checkpoint; "
+                                "loaded checkpoint is a nanoGPT-style pretrain model"})
+    return None
+
+
 # ── Endpoints ────────────────────────────────────────────────────────────
 
 
@@ -199,9 +228,11 @@ async def chat_stream(req: ChatRequest):
                 return None
 
         # CoT mode: split the stream on the literal "<|/think|>" decoded text.
-        # Tokens before that boundary are reasoning; after, response.
+        # Tokens before that boundary are reasoning; after, response. The
+        # nanoGPT pretrain checkpoint uses GPT-2 BPE which has no think tokens,
+        # so CoT can only get stuck — force it off for that arch.
         END_THINK = "<|/think|>"
-        in_think = bool(req.cot)
+        in_think = bool(req.cot) and arch == "havoc"
         buf = ""
         if in_think:
             yield _sse({"type": "thinking_start"})
@@ -264,22 +295,34 @@ async def chat_refine(req: RefineRequest):
             yield _sse({"type": "done"})
             return
 
-        # Build a per-request RefinementEngine bound to our InferenceEngine
-        from inference import _BareStreamingAdapter
-        refiner = RefinementEngine(
-            engine                = _BareStreamingAdapter(engine),
-            max_passes            = req.max_passes,
-            confidence_threshold  = req.confidence_threshold,
-            similarity_threshold  = req.similarity_threshold,
-            max_pass_tokens       = req.max_pass_tokens,
-            max_final_tokens      = req.max_final_tokens,
-            temperature           = req.temperature,
-            top_k                 = req.top_k,
-            top_p                 = req.top_p,
-        )
+        if arch == "nanogpt":
+            # Pretrain checkpoint: use the intrinsic log-prob reasoning engine
+            reasoner = ReasoningEngine(
+                engine          = engine,
+                n_passes        = req.max_passes,
+                max_pass_tokens = req.max_pass_tokens,
+                temperature     = req.temperature,
+                top_k           = req.top_k,
+                top_p           = req.top_p,
+            )
+            stream = reasoner.stream(req.user_message, system_prompt=req.system_prompt)
+        else:
+            # SFT/HAVOC checkpoint: original prompt-based self-report refinement
+            from inference import _BareStreamingAdapter
+            refiner = RefinementEngine(
+                engine                = _BareStreamingAdapter(engine),
+                max_passes            = req.max_passes,
+                confidence_threshold  = req.confidence_threshold,
+                similarity_threshold  = req.similarity_threshold,
+                max_pass_tokens       = req.max_pass_tokens,
+                max_final_tokens      = req.max_final_tokens,
+                temperature           = req.temperature,
+                top_k                 = req.top_k,
+                top_p                 = req.top_p,
+            )
+            stream = refiner.stream(req.user_message, system_prompt=req.system_prompt)
 
         loop = asyncio.get_running_loop()
-        stream = refiner.stream(req.user_message, system_prompt=req.system_prompt)
 
         def next_event():
             try:
@@ -305,7 +348,7 @@ async def chat_refine(req: RefineRequest):
 async def chat_orchestrate(req: OrchestrateRequest):
     """Full orchestration pipeline."""
     async def gen() -> AsyncGenerator[str, None]:
-        err = _ensure_loaded()
+        err = _ensure_loaded() or _ensure_havoc_arch()
         if err:
             yield err
             yield _sse({"type": "done"})
