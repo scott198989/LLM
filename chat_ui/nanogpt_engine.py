@@ -86,6 +86,7 @@ class NanoGPTEngine:
         self.ckpt_meta: dict                 = {}
         self.loaded:    bool                 = False
         self._system_prompt: str             = ""
+        self.phase:     str                  = "pretrain"   # "pretrain" | "sft"
 
     def set_system_prompt(self, text: str) -> None:
         self._system_prompt = (text or "").strip()
@@ -118,6 +119,7 @@ class NanoGPTEngine:
         self.cfg       = cfg
         self.device    = device
         self.loaded    = True
+        self.phase     = ck.get("phase") or "pretrain"
 
         n_params = sum(p.numel() for p in model.parameters())
         val_loss = ck.get("val_loss")
@@ -136,6 +138,7 @@ class NanoGPTEngine:
             "num_heads":   cfg.n_head,
             "hidden_size": cfg.n_embd,
             "arch":        "nanogpt",
+            "phase":       self.phase,
         }
         return self.ckpt_meta
 
@@ -162,10 +165,19 @@ class NanoGPTEngine:
         stats  = GenStats()
         t_start = time.perf_counter()
 
-        text = ""
-        if self._system_prompt:
-            text += self._system_prompt.rstrip() + "\n\n"
-        text += prompt
+        # SFT checkpoints were trained on "User: {p}\n\nAssistant: {c}<|endoftext|>"
+        # — wrap user input the same way so the model recognizes the format.
+        # Pretrain checkpoints keep raw-completion behavior.
+        if self.phase == "sft" and wrap_chat:
+            text = ""
+            if self._system_prompt:
+                text += self._system_prompt.rstrip() + "\n\n"
+            text += f"User: {prompt}\n\nAssistant: "
+        else:
+            text = ""
+            if self._system_prompt:
+                text += self._system_prompt.rstrip() + "\n\n"
+            text += prompt
 
         eot_id = self.tokenizer.eot_token  # GPT-2: 50256
         ids = self.tokenizer.encode(text, disallowed_special=())
